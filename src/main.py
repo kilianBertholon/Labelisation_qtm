@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QGridLayout, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QSlider, QLineEdit, QMessageBox, QCheckBox, QComboBox
 )
+from PySide6.QtWidgets import QProgressBar
 from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
 
@@ -81,6 +82,7 @@ class Annotation:
 
 class VideoWorker(QThread):
     frames_ready = Signal(list, int)  # list of QImage or None, current_frame_idx
+    transcode_progress = Signal(int, int)  # cam_idx, percent
 
     def __init__(self, paths, cache_size=120, use_hwaccel=False, parent=None):
         super().__init__(parent)
@@ -180,6 +182,39 @@ class VideoWorker(QThread):
             if cap:
                 cap.release()
         self.caps = []
+        # attempt to remove any transcoded temporary files we created
+        try:
+            for p in list(self.transcoded_paths or []):
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        # reset tracking
+        try:
+            self.transcoded_paths = [None] * len(self.paths)
+        except Exception:
+            self.transcoded_paths = []
+
+    def cleanup_transcoded(self):
+        """Explicit cleanup method to remove any transcoded temp files.
+        Can be called from the GUI thread on shutdown to ensure files are removed.
+        """
+        try:
+            for p in list(self.transcoded_paths or []):
+                if p and os.path.exists(p):
+                    try:
+                        os.remove(p)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        try:
+            self.transcoded_paths = [None] * len(self.paths)
+        except Exception:
+            self.transcoded_paths = []
 
     def run(self):
         if cv2 is None:
@@ -324,19 +359,93 @@ class VideoWorker(QThread):
                 '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
                 '-c:a', 'aac', '-movflags', '+faststart', out_path
             ]
+        # determine duration via ffprobe if possible
+        duration = self._ffprobe_duration(src)
         try:
             if self.use_hwaccel:
                 print(f"ffmpeg: transcoding with hwaccel {src} -> {out_path}")
             else:
                 print(f"ffmpeg: transcoding {src} -> {out_path}")
-            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
-            if res.returncode == 0 and os.path.exists(out_path):
+            # run ffmpeg with -progress pipe:1 to get periodic progress updates
+            popen = subprocess.Popen(cmd + ['-progress', 'pipe:1'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            percent = 0
+            if popen.stdout:
+                for line in popen.stdout:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # parse key=value lines
+                    if '=' in line:
+                        k, v = line.split('=', 1)
+                        k = k.strip()
+                        v = v.strip()
+                        if k in ('out_time_ms', 'out_time_us'):
+                            try:
+                                out_ms = int(v)
+                                out_s = out_ms / 1000.0
+                                if duration and duration > 0:
+                                    newp = int(min(100, (out_s / duration) * 100))
+                                    if newp != percent:
+                                        percent = newp
+                                        try:
+                                            self.transcode_progress.emit(cam_idx, percent)
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                        elif k == 'out_time':
+                            # format HH:MM:SS.micro
+                            try:
+                                parts = v.split(':')
+                                h = float(parts[0]); m = float(parts[1]); s = float(parts[2])
+                                out_s = h*3600 + m*60 + s
+                                if duration and duration > 0:
+                                    newp = int(min(100, (out_s / duration) * 100))
+                                    if newp != percent:
+                                        percent = newp
+                                        try:
+                                            self.transcode_progress.emit(cam_idx, percent)
+                                        except Exception:
+                                            pass
+                            except Exception:
+                                pass
+                        elif k == 'progress' and v == 'end':
+                            percent = 100
+                            try:
+                                self.transcode_progress.emit(cam_idx, percent)
+                            except Exception:
+                                pass
+            rc = popen.wait()
+            if rc == 0 and os.path.exists(out_path):
                 self.transcoded_paths[cam_idx] = out_path
                 return out_path
             else:
-                print(f"ffmpeg failed for {src}: rc={res.returncode} stderr={res.stderr.decode(errors='ignore')}")
+                stderr = ''
+                try:
+                    stderr = popen.stderr.read()
+                except Exception:
+                    pass
+                print(f"ffmpeg failed for {src}: rc={rc} stderr={stderr}")
         except Exception as e:
             print(f"ffmpeg exception: {e}")
+        # ensure UI gets 100 on failure end to avoid stuck bars
+        try:
+            self.transcode_progress.emit(cam_idx, 100)
+        except Exception:
+            pass
+        return None
+
+    def _ffprobe_duration(self, path):
+        try:
+            res = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'default=noprint_wrappers=1:nokey=1', str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=10)
+            if res.returncode == 0:
+                out = res.stdout.strip()
+                try:
+                    return float(out)
+                except Exception:
+                    return None
+        except Exception:
+            return None
         return None
 
     def _prefetch_initial(self):
@@ -462,6 +571,7 @@ class MainWindow(QWidget):
         self.video_labels = []
         self.paths = []
         self.worker = None
+        self._progress_per_cam = {}
         self.annotations = []
         # signal to request a step from worker thread
         self.init_ui()
@@ -529,6 +639,13 @@ class MainWindow(QWidget):
         ann.addWidget(btn_export)
         main.addLayout(ann)
 
+    # Global transcode progress bar (hidden until used)
+        self.global_progress = QProgressBar()
+        self.global_progress.setRange(0, 100)
+        self.global_progress.setValue(0)
+        self.global_progress.setVisible(False)
+        main.addWidget(self.global_progress)
+
         self.setLayout(main)
 
     @Slot()
@@ -550,6 +667,12 @@ class MainWindow(QWidget):
         print(f"GPU checkbox requested: {use_hw}")
         self.worker = VideoWorker(self.paths, cache_size=120, use_hwaccel=use_hw)
         self.worker.frames_ready.connect(self.on_frames)
+        try:
+            self.worker.transcode_progress.connect(self.on_transcode_progress)
+        except Exception:
+            pass
+        # reset progress tracking
+        self._progress_per_cam = {i: 0 for i in range(len(self.paths))}
         # connect the step signal to the worker slot (queued connection)
         try:
             self.step_signal.connect(self.worker.step_request)
@@ -658,6 +781,14 @@ class MainWindow(QWidget):
         if self.worker:
             self.worker.stop()
             self.worker.wait(200)
+            try:
+                self.worker.cleanup_transcoded()
+            except Exception:
+                pass
+        try:
+            self.global_progress.setVisible(False)
+        except Exception:
+            pass
         event.accept()
 
     @Slot(int)
@@ -667,6 +798,28 @@ class MainWindow(QWidget):
             print('GPU requested by user (will be used if OpenCV CUDA is available).')
         else:
             print('GPU not requested; using CPU decoding.')
+
+    @Slot(int, int)
+    def on_transcode_progress(self, cam_idx: int, percent: int):
+        # update per-cam progress and show averaged global progress
+        try:
+            n = max(1, len(self.paths))
+            # ensure dict keys for all cams
+            if not self._progress_per_cam or len(self._progress_per_cam) != n:
+                self._progress_per_cam = {i: 0 for i in range(n)}
+            self._progress_per_cam[cam_idx] = int(percent)
+            total = sum(self._progress_per_cam.get(i, 0) for i in range(n))
+            avg = int(total / n)
+            # show progress bar
+            self.global_progress.setVisible(True)
+            self.global_progress.setValue(avg)
+            # hide when complete
+            if avg >= 100:
+                # reset after showing 100%
+                self.global_progress.setVisible(False)
+                self._progress_per_cam = {i: 0 for i in range(n)}
+        except Exception:
+            pass
 
 
 def main():
