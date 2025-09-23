@@ -153,6 +153,23 @@ class VideoWorker(QThread):
             cache.popitem(last=False)
         return frame
 
+    @Slot(int)
+    def step_request(self, n: int):
+        """Slot callable from main thread via signal/queued connection to change
+        current frame and emit the corresponding images from the worker thread."""
+        self.current_frame = max(0, self.current_frame + int(n))
+        imgs = []
+        for i, cap in enumerate(self.caps):
+            frame = self._get_frame(i, self.current_frame)
+            if frame is None:
+                imgs.append(None)
+            else:
+                h, w, ch = frame.shape
+                bytes_per_line = ch * w
+                image = QImage(frame.data, w, h, bytes_per_line, QImage.Format_BGR888)
+                imgs.append(image.copy())
+        self.frames_ready.emit(imgs, self.current_frame)
+
     def seek(self, frame_idx):
         self.current_frame = int(frame_idx)
 
@@ -170,6 +187,8 @@ class VideoWorker(QThread):
 
 
 class MainWindow(QWidget):
+    step_signal = Signal(int)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle('multicam_annotator')
@@ -177,6 +196,7 @@ class MainWindow(QWidget):
         self.paths = []
         self.worker = None
         self.annotations = []
+        # signal to request a step from worker thread
         self.init_ui()
 
     def init_ui(self):
@@ -255,6 +275,12 @@ class MainWindow(QWidget):
             self.worker.wait(200)
         self.worker = VideoWorker(self.paths, cache_size=120)
         self.worker.frames_ready.connect(self.on_frames)
+        # connect the step signal to the worker slot (queued connection)
+        try:
+            self.step_signal.connect(self.worker.step_request)
+        except Exception:
+            # fallback: direct method assignment (shouldn't happen)
+            pass
         self.worker.start()
         self.btn_play.setEnabled(True)
         self.slider.setEnabled(True)
@@ -264,12 +290,13 @@ class MainWindow(QWidget):
     @Slot()
     def step_prev(self):
         if self.worker:
-            self.worker.step(-1)
+            # request a single-step backwards
+            self.step_signal.emit(-1)
 
     @Slot()
     def step_next(self):
         if self.worker:
-            self.worker.step(1)
+            self.step_signal.emit(1)
 
     @Slot(str)
     def on_speed_changed(self, txt: str):
@@ -311,7 +338,10 @@ class MainWindow(QWidget):
     @Slot(int)
     def on_seek(self, v):
         if self.worker:
+            # set current frame in worker thread by seeking and emitting a frame
             self.worker.seek(v)
+            # emit current frame images immediately
+            self.step_signal.emit(0)
 
     @Slot()
     def add_label(self):
