@@ -45,7 +45,7 @@ from PySide6.QtWidgets import QTabWidget
 from PySide6.QtWidgets import QProgressBar
 from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush
-from PySide6.QtWidgets import QDialog, QListWidget, QTextEdit, QVBoxLayout
+from PySide6.QtWidgets import QDialog, QListWidget, QTextEdit, QVBoxLayout, QListWidgetItem
 from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
 try:
     # prefer absolute import so running `python src/main.py` works
@@ -106,6 +106,9 @@ class TimelineWidget(QWidget):
             self.setMouseTracking(True)
         except Exception:
             pass
+
+    # signal emitted when a marker is clicked (frame_idx)
+    marker_clicked = Signal(int)
 
     def set_annotations(self, annotations, total_frames=None):
         try:
@@ -208,7 +211,22 @@ class TimelineWidget(QWidget):
                 except Exception:
                     pass
             if hit:
-                txt = f"Cam {hit.cam} | Frame {hit.frame_idx} | {hit.time_sec:.3f}s | {hit.label}"
+                # derive top label and sublabel from stored label text if hierarchical (use '/' as separator)
+                try:
+                    label_text = hit.label or ''
+                    if '/' in label_text:
+                        parts = label_text.split('/')
+                        top = parts[0]
+                        sub = '/'.join(parts[1:]) if len(parts) > 1 else ''
+                    else:
+                        top = label_text
+                        sub = ''
+                except Exception:
+                    top = hit.label or ''
+                    sub = ''
+                txt = f"Frame {hit.frame_idx} | {hit.time_sec:.3f}s | {top}"
+                if sub:
+                    txt = txt + f" ({sub})"
                 QToolTip.showText(event.globalPosition().toPoint() if hasattr(event, 'globalPosition') else event.globalPos(), txt, self)
             else:
                 QToolTip.hideText()
@@ -221,6 +239,30 @@ class TimelineWidget(QWidget):
     def leaveEvent(self, event):
         try:
             QToolTip.hideText()
+        except Exception:
+            pass
+
+    def mousePressEvent(self, event):
+        try:
+            x = event.position().x() if hasattr(event, 'position') else event.x()
+            w = max(1, self.width())
+            hit_dist = 10
+            hit = None
+            for ann in (self.annotations or []):
+                try:
+                    if not isinstance(ann, Annotation):
+                        continue
+                    px = int((ann.frame_idx / float(self.total_frames)) * (w-8)) + 4
+                    if abs(px - int(x)) <= hit_dist:
+                        hit = ann
+                        break
+                except Exception:
+                    pass
+            if hit:
+                try:
+                    self.marker_clicked.emit(int(hit.frame_idx))
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -770,13 +812,14 @@ class MainWindow(QWidget):
         hadd.addWidget(btn_add_label)
         left_layout.addLayout(hadd)
 
-        # Label catalog (read-only view) - editing moved to Paramètres
+        # Label catalog (tree view) - editing moved to Paramètres
         left_layout.addWidget(QLabel('Catalogue de labels'))
+        # keep the tree model for editor and internal operations
         self.label_tree = QTreeWidget()
         self.label_tree.setHeaderHidden(True)
         self.label_tree.setFixedHeight(180)
         left_layout.addWidget(self.label_tree)
-        left_layout.addWidget(QLabel("(Édition des labels: Paramètres → Catalogue)") )
+        left_layout.addWidget(QLabel("(Édition des labels: Paramètres → Catalogue)"))
         # default catalog path
         try:
             self.catalog_path = Path.cwd() / 'label_catalog.json'
@@ -823,6 +866,11 @@ class MainWindow(QWidget):
         try:
             self.timeline = TimelineWidget()
             right_layout.addWidget(self.timeline)
+            try:
+                # connect marker click signal to main window handler
+                self.timeline.marker_clicked.connect(self.on_timeline_marker_clicked)
+            except Exception:
+                pass
         except Exception:
             self.timeline = None
         self.right_widget.setLayout(right_layout)
@@ -1058,15 +1106,20 @@ class MainWindow(QWidget):
         current = self.slider.value()
         fps = min(self.worker.fps) if self.worker and self.worker.fps else 30.0
         t = current / fps
-        # add annotation per camera and reflect in the left panel list
+        # add annotation per camera (internal model) and add a single visible line in the annotations list
         for i in range(len(self.paths)):
             ann = Annotation(cam=i+1, frame_idx=current, time_sec=t, label=txt)
             self.annotations.append(ann)
+        try:
+            item_text = f"{current}|{t:.3f}|{txt}"
+            item = QListWidgetItem(item_text)
             try:
-                item_text = f"{i+1}|{current}|{t:.3f}|{txt}"
-                self.ann_list.addItem(item_text)
+                item.setData(Qt.UserRole, {'frame': current, 'label': txt})
             except Exception:
                 pass
+            self.ann_list.addItem(item)
+        except Exception:
+            pass
         # clear input for convenience
         try:
             if getattr(self, 'label_input', None):
@@ -1303,6 +1356,11 @@ class MainWindow(QWidget):
                     add_obj(it, c)
             for o in data or []:
                 add_obj(None, o)
+            # refresh the tree view
+            try:
+                self._dict_to_tree(data)
+            except Exception:
+                pass
         except Exception as e:
             QMessageBox.critical(self, 'Erreur', f'Impossible de charger: {e}')
 
@@ -1335,8 +1393,15 @@ class MainWindow(QWidget):
         if not path:
             return
         # build rows with separate 'label' and 'sublabel' when hierarchy exists
-        rows = []
+        # produce one row per unique (frame,label) across all cameras (camera column removed)
+        uniq = {}
         for a in self.annotations:
+            key = (a.frame_idx, a.label)
+            # keep the earliest occurrence time if duplicates exist
+            if key not in uniq or (a.time_sec is not None and a.time_sec < uniq[key].time_sec):
+                uniq[key] = a
+        rows = []
+        for key, a in sorted(uniq.items(), key=lambda kv: (kv[0][0], kv[0][1])):
             top, sub = self._find_label_hierarchy(a.label)
             if sub:
                 lab = top or ''
@@ -1344,7 +1409,7 @@ class MainWindow(QWidget):
             else:
                 lab = top or a.label or ''
                 sublab = ''
-            rows.append({'camera': a.cam, 'frame': a.frame_idx, 'time_s': a.time_sec, 'label': lab, 'sublabel': sublab})
+            rows.append({'frame': a.frame_idx, 'time_s': a.time_sec, 'label': lab, 'sublabel': sublab})
         df = pd.DataFrame(rows)
         try:
             df.to_excel(path, index=False)
@@ -1523,15 +1588,48 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
+    @Slot(int)
+    def on_timeline_marker_clicked(self, frame_idx: int):
+        try:
+            # set slider and request frame from worker
+            try:
+                self.slider.setValue(int(frame_idx))
+            except Exception:
+                pass
+            if self.worker:
+                self.worker.seek(int(frame_idx))
+                self.step_signal.emit(0)
+        except Exception:
+            pass
+
     def delete_selected_annotation(self):
         try:
-            idx = self.ann_list.currentRow()
-            if idx < 0:
+            item = self.ann_list.currentItem()
+            if not item:
                 return
-            # remove from annotations model (assume 1-to-1 ordering)
-            if 0 <= idx < len(self.annotations):
-                del self.annotations[idx]
-            self.ann_list.takeItem(idx)
+            frm = None
+            lbl = None
+            try:
+                data = item.data(Qt.UserRole)
+                if isinstance(data, dict):
+                    frm = int(data.get('frame'))
+                    lbl = data.get('label')
+            except Exception:
+                pass
+            if frm is None:
+                try:
+                    parts = item.text().split('|')
+                    frm = int(parts[0])
+                    lbl = parts[2] if len(parts) > 2 else parts[-1]
+                except Exception:
+                    pass
+            if frm is not None and lbl is not None:
+                try:
+                    self.annotations = [a for a in self.annotations if not (a.frame_idx == frm and a.label == lbl)]
+                except Exception:
+                    pass
+            row = self.ann_list.row(item)
+            self.ann_list.takeItem(row)
             # update timeline after deletion
             try:
                 if getattr(self, 'timeline', None):
@@ -1548,16 +1646,26 @@ class MainWindow(QWidget):
 
     def on_annotation_double_click(self, item):
         """Double-clicking an annotation jumps to the frame for that camera.
-        Item text format: 'cam|frame|time|label'
+        Item text format: 'frame|time|label' (one line per label across cams)
         """
         try:
-            txt = item.text()
-            parts = txt.split('|')
-            if len(parts) < 2:
-                return
-            cam = int(parts[0])
-            frame = int(parts[1])
-            # set slider and request frame
+            frm = None
+            try:
+                data = item.data(Qt.UserRole)
+                if isinstance(data, dict) and 'frame' in data:
+                    frm = int(data.get('frame'))
+            except Exception:
+                frm = None
+            if frm is None:
+                try:
+                    parts = item.text().split('|')
+                    if len(parts) >= 1:
+                        frm = int(parts[0])
+                    else:
+                        return
+                except Exception:
+                    return
+            frame = int(frm)
             try:
                 self.slider.setValue(frame)
             except Exception:
