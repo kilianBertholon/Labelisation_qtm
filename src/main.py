@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QGridLayout, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QSlider, QLineEdit, QMessageBox, QCheckBox, QComboBox
 )
+from PySide6.QtWidgets import QToolTip
 from PySide6.QtWidgets import QTabWidget
 from PySide6.QtWidgets import QProgressBar
 from PySide6.QtCore import Qt, QThread, Signal, Slot
@@ -100,6 +101,11 @@ class TimelineWidget(QWidget):
         self.total_frames = 1
         self.current_frame = 0
         self.setMinimumHeight(40)
+        # enable mouse tracking to show tooltips on hover without pressing buttons
+        try:
+            self.setMouseTracking(True)
+        except Exception:
+            pass
 
     def set_annotations(self, annotations, total_frames=None):
         try:
@@ -109,6 +115,7 @@ class TimelineWidget(QWidget):
             self.update()
         except Exception:
             pass
+
 
     def set_total_frames(self, total_frames: int):
         try:
@@ -175,6 +182,47 @@ class TimelineWidget(QWidget):
                 pass
         finally:
             qp.end()
+
+    def mouseMoveEvent(self, event):
+        try:
+            if not self.annotations:
+                QToolTip.hideText()
+                return
+            x = event.position().x() if hasattr(event, 'position') else event.x()
+            w = max(1, self.width())
+            # convert mouse x to frame estimate
+            rel = (x - 4) / float(max(1, w - 8))
+            rel = max(0.0, min(1.0, rel))
+            frame_at_mouse = int(rel * float(max(1, self.total_frames)))
+            # hit-test annotations by computing their x positions and checking proximity
+            hit = None
+            hit_dist = 10
+            for ann in (self.annotations or []):
+                try:
+                    if not isinstance(ann, Annotation):
+                        continue
+                    px = int((ann.frame_idx / float(self.total_frames)) * (w-8)) + 4
+                    if abs(px - int(x)) <= hit_dist:
+                        hit = ann
+                        break
+                except Exception:
+                    pass
+            if hit:
+                txt = f"Cam {hit.cam} | Frame {hit.frame_idx} | {hit.time_sec:.3f}s | {hit.label}"
+                QToolTip.showText(event.globalPosition().toPoint() if hasattr(event, 'globalPosition') else event.globalPos(), txt, self)
+            else:
+                QToolTip.hideText()
+        except Exception:
+            try:
+                QToolTip.hideText()
+            except Exception:
+                pass
+
+    def leaveEvent(self, event):
+        try:
+            QToolTip.hideText()
+        except Exception:
+            pass
 
 
 class VideoWorker(QThread):
