@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtWidgets import QTabWidget
 from PySide6.QtWidgets import QProgressBar
 from PySide6.QtCore import Qt, QThread, Signal, Slot
-from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush
 from PySide6.QtWidgets import QDialog, QListWidget, QTextEdit, QVBoxLayout
 from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
 try:
@@ -88,6 +88,93 @@ class Annotation:
     frame_idx: int
     time_sec: float
     label: str
+
+
+class TimelineWidget(QWidget):
+    """Simple horizontal timeline that draws colored markers for annotations.
+    It expects annotations as list of Annotation and a total_frames value.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.annotations = []
+        self.total_frames = 1
+        self.current_frame = 0
+        self.setMinimumHeight(40)
+
+    def set_annotations(self, annotations, total_frames=None):
+        try:
+            self.annotations = list(annotations or [])
+            if total_frames and total_frames > 0:
+                self.total_frames = int(total_frames)
+            self.update()
+        except Exception:
+            pass
+
+    def set_total_frames(self, total_frames: int):
+        try:
+            if total_frames and total_frames > 0:
+                self.total_frames = int(total_frames)
+            self.update()
+        except Exception:
+            pass
+
+    def set_current_frame(self, frame_idx: int):
+        try:
+            self.current_frame = int(frame_idx)
+            self.update()
+        except Exception:
+            pass
+
+    def color_for_label(self, label: str) -> QColor:
+        try:
+            import hashlib
+            if not label:
+                return QColor(180, 180, 180)
+            h = int(hashlib.md5(label.encode('utf8')).hexdigest()[:6], 16)
+            hue = h % 360
+            col = QColor()
+            col.setHsv(hue, 200, 230)
+            return col
+        except Exception:
+            return QColor(180, 180, 180)
+
+    def paintEvent(self, event):
+        qp = QPainter(self)
+        try:
+            w = max(1, self.width())
+            h = max(1, self.height())
+            # background
+            qp.fillRect(0, 0, w, h, QColor(30, 30, 30))
+            # draw baseline
+            pen = QPen(QColor(100, 100, 100))
+            qp.setPen(pen)
+            qp.drawLine(4, h//2, w-4, h//2)
+            # draw annotations as small colored rectangles
+            for ann in (self.annotations or []):
+                try:
+                    if not isinstance(ann, Annotation):
+                        continue
+                    if self.total_frames <= 0:
+                        continue
+                    x = int((ann.frame_idx / float(self.total_frames)) * (w-8)) + 4
+                    col = self.color_for_label(ann.label)
+                    qp.setBrush(QBrush(col))
+                    qp.setPen(QPen(col.darker(110)))
+                    # draw small rectangle centered on baseline
+                    rw = 6
+                    rh = 12
+                    qp.drawRect(x - rw//2, (h//2) - rh//2, rw, rh)
+                except Exception:
+                    pass
+            # draw current frame indicator
+            try:
+                cx = int((self.current_frame / float(max(1, self.total_frames))) * (w-8)) + 4
+                qp.setPen(QPen(QColor(255, 200, 60), 2))
+                qp.drawLine(cx, 2, cx, h-2)
+            except Exception:
+                pass
+        finally:
+            qp.end()
 
 
 class VideoWorker(QThread):
@@ -684,6 +771,12 @@ class MainWindow(QWidget):
         self.right_widget = QWidget()
         right_layout = QVBoxLayout()
         right_layout.addLayout(self.video_grid)
+        # timeline widget showing annotation markers under the video grid
+        try:
+            self.timeline = TimelineWidget()
+            right_layout.addWidget(self.timeline)
+        except Exception:
+            self.timeline = None
         self.right_widget.setLayout(right_layout)
         content.addWidget(self.right_widget, stretch=1)
 
@@ -806,6 +899,14 @@ class MainWindow(QWidget):
         self.slider.setEnabled(True)
         self.btn_prev.setEnabled(True)
         self.btn_next.setEnabled(True)
+        # try to initialize timeline total frames if worker already has frame counts
+        try:
+            if getattr(self, 'timeline', None) and getattr(self.worker, 'frame_counts', None):
+                vals = [c for c in self.worker.frame_counts if c > 0]
+                if vals:
+                    self.timeline.set_total_frames(min(vals))
+        except Exception:
+            pass
 
     @Slot()
     def step_prev(self):
@@ -842,6 +943,24 @@ class MainWindow(QWidget):
         # refresh unit label to reflect current frame/time
         try:
             self._refresh_unit_label(frame_idx)
+        except Exception:
+            pass
+        # update timeline annotations and current frame indicator
+        try:
+            if getattr(self, 'timeline', None):
+                # ensure timeline knows total frames when available
+                try:
+                    if self.worker and getattr(self.worker, 'frame_counts', None):
+                        vals = [c for c in self.worker.frame_counts if c > 0]
+                        if vals:
+                            self.timeline.set_total_frames(min(vals))
+                except Exception:
+                    pass
+                try:
+                    self.timeline.set_annotations(self.annotations, total_frames=getattr(self.timeline, 'total_frames', 1))
+                    self.timeline.set_current_frame(frame_idx)
+                except Exception:
+                    pass
         except Exception:
             pass
 
@@ -904,6 +1023,18 @@ class MainWindow(QWidget):
         try:
             if getattr(self, 'label_input', None):
                 self.label_input.clear()
+        except Exception:
+            pass
+        # update timeline after adding annotations
+        try:
+            if getattr(self, 'timeline', None):
+                try:
+                    vals = [c for c in (self.worker.frame_counts if self.worker and getattr(self.worker, 'frame_counts', None) else []) if c > 0]
+                    total = min(vals) if vals else max(1, self.slider.maximum())
+                    self.timeline.set_annotations(self.annotations, total_frames=total)
+                    self.timeline.set_current_frame(current)
+                except Exception:
+                    pass
         except Exception:
             pass
         QMessageBox.information(self, 'Annotation', f'Label "{txt}" ajouté au frame {current} ({t:.3f}s) pour {len(self.paths)} cam(s).')
@@ -1353,6 +1484,17 @@ class MainWindow(QWidget):
             if 0 <= idx < len(self.annotations):
                 del self.annotations[idx]
             self.ann_list.takeItem(idx)
+            # update timeline after deletion
+            try:
+                if getattr(self, 'timeline', None):
+                    try:
+                        vals = [c for c in (self.worker.frame_counts if self.worker and getattr(self.worker, 'frame_counts', None) else []) if c > 0]
+                        total = min(vals) if vals else max(1, self.slider.maximum())
+                        self.timeline.set_annotations(self.annotations, total_frames=total)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except Exception:
             pass
 
