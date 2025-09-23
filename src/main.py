@@ -29,6 +29,11 @@ import time
 from pathlib import Path
 from collections import OrderedDict
 from dataclasses import dataclass
+import shutil
+import subprocess
+import tempfile
+import os
+import threading
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QGridLayout, QVBoxLayout, QHBoxLayout,
@@ -48,6 +53,24 @@ except Exception:
     pd = None
 
 
+def is_opencv_cuda_available():
+    """Return True if OpenCV was built with CUDA support and a device is available."""
+    if cv2 is None:
+        return False
+    try:
+        # prefer runtime query
+        if hasattr(cv2, 'cuda'):
+            try:
+                return int(cv2.cuda.getCudaEnabledDeviceCount() or 0) > 0
+            except Exception:
+                # continue to build-info fallback
+                pass
+        info = cv2.getBuildInformation()
+        return 'CUDA' in info
+    except Exception:
+        return False
+
+
 @dataclass
 class Annotation:
     cam: int
@@ -59,7 +82,7 @@ class Annotation:
 class VideoWorker(QThread):
     frames_ready = Signal(list, int)  # list of QImage or None, current_frame_idx
 
-    def __init__(self, paths, cache_size=120, parent=None):
+    def __init__(self, paths, cache_size=120, use_hwaccel=False, parent=None):
         super().__init__(parent)
         self.paths = paths
         self.caps = [None] * len(paths)
@@ -71,6 +94,19 @@ class VideoWorker(QThread):
         self.playback_rate = 1.0
         self.cache_size = cache_size
         self.caches = [OrderedDict() for _ in paths]
+        # failure tracking to avoid crashing on bad decodes
+        self.cap_failed = [False] * len(paths)
+        self.cap_fail_count = [0] * len(paths)
+        # ffmpeg fallback state
+        self.ffmpeg_available = bool(shutil.which('ffmpeg'))
+        self.transcoded_paths = [None] * len(paths)
+        # whether to request hwaccel flags for ffmpeg transcode (if available)
+        self.use_hwaccel = bool(use_hwaccel)
+        # locks and state for safe concurrent prefetching/reading
+        self.cap_locks = [threading.Lock() for _ in paths]
+        self.last_pos = [-1] * len(paths)
+        self.prefetch_thread = None
+        self.prefetch_stop = threading.Event()
 
     def open_all(self):
         for i, p in enumerate(self.paths):
@@ -80,17 +116,66 @@ class VideoWorker(QThread):
             except Exception:
                 cap = None
             if cap is None or not cap.isOpened():
-                self.caps[i] = None
-                self.fps.append(30.0)
-                self.frame_counts.append(0)
-                continue
+                # try ffmpeg transcode fallback if available
+                if self.ffmpeg_available:
+                    newp = self._try_transcode_once(i)
+                    if newp:
+                        try:
+                            cap = cv2.VideoCapture(str(newp))
+                        except Exception:
+                            cap = None
+                if cap is None or not cap.isOpened():
+                    self.caps[i] = None
+                    self.fps.append(30.0)
+                    self.frame_counts.append(0)
+                    continue
+            else:
+                # cap opened; but avoid reading frames in-process if ffmpeg detects decode errors
+                if self.ffmpeg_available:
+                    try:
+                        ok = self._ffmpeg_probe(p)
+                    except Exception:
+                        ok = True
+                    if not ok:
+                        # transcode and reopen
+                        newp = self._try_transcode_once(i)
+                        if newp:
+                            try:
+                                # release old cap and open new one
+                                try:
+                                    cap.release()
+                                except Exception:
+                                    pass
+                                cap = cv2.VideoCapture(str(newp))
+                            except Exception:
+                                cap = None
+                        if cap is None or not cap.isOpened():
+                            self.caps[i] = None
+                            self.fps.append(30.0)
+                            self.frame_counts.append(0)
+                            continue
             self.caps[i] = cap
             fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
             frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
             self.fps.append(fps)
             self.frame_counts.append(frames)
+        # start initial prefetch in background to fill caches and avoid heavy seeks
+        try:
+            if any(cap is not None for cap in self.caps):
+                self.prefetch_stop.clear()
+                self.prefetch_thread = threading.Thread(target=self._prefetch_initial, daemon=True)
+                self.prefetch_thread.start()
+        except Exception:
+            pass
 
     def close_all(self):
+        # stop prefetch thread
+        try:
+            self.prefetch_stop.set()
+            if self.prefetch_thread and self.prefetch_thread.is_alive():
+                self.prefetch_thread.join(timeout=1.0)
+        except Exception:
+            pass
         for cap in self.caps:
             if cap:
                 cap.release()
@@ -122,7 +207,18 @@ class VideoWorker(QThread):
             last_time = now
             imgs = []
             for i, cap in enumerate(self.caps):
-                frame = self._get_frame(i, self.current_frame)
+                try:
+                    frame = self._get_frame(i, self.current_frame)
+                except Exception:
+                    # unexpected C++/cv2 exception - mark camera failed
+                    try:
+                        self.cap_fail_count[i] += 1
+                        if self.cap_fail_count[i] > 5:
+                            self.cap_failed[i] = True
+                    except Exception:
+                        pass
+                    imgs.append(None)
+                    continue
                 if frame is None:
                     imgs.append(None)
                 else:
@@ -138,20 +234,177 @@ class VideoWorker(QThread):
 
     def _get_frame(self, cam_idx, frame_idx):
         cache = self.caches[cam_idx]
-        if frame_idx in cache:
-            cache.move_to_end(frame_idx)
-            return cache[frame_idx]
-        cap = self.caps[cam_idx]
-        if cap is None:
+        # fast path: cached
+        with self.cap_locks[cam_idx]:
+            if frame_idx in cache:
+                cache.move_to_end(frame_idx)
+                return cache[frame_idx]
+            cap = self.caps[cam_idx]
+            if cap is None:
+                return None
+            try:
+                # prefer sequential read when possible to avoid heavy cap.set calls
+                if self.last_pos[cam_idx] == frame_idx - 1:
+                    ok, frame = cap.read()
+                    if ok and frame is not None:
+                        self.last_pos[cam_idx] = frame_idx
+                else:
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                    ok, frame = cap.read()
+                    if ok and frame is not None:
+                        self.last_pos[cam_idx] = frame_idx
+            except Exception:
+                # treat as a failure; increment counter and possibly mark failed
+                self.cap_fail_count[cam_idx] += 1
+                if self.cap_fail_count[cam_idx] > 5:
+                    self.cap_failed[cam_idx] = True
+                # try to transcode once if available and not already tried
+                if self.ffmpeg_available and not self.transcoded_paths[cam_idx]:
+                    newp = self._try_transcode_once(cam_idx)
+                    if newp:
+                        try:
+                            try:
+                                if self.caps[cam_idx]:
+                                    self.caps[cam_idx].release()
+                            except Exception:
+                                pass
+                            self.caps[cam_idx] = cv2.VideoCapture(str(newp))
+                            self.cap_fail_count[cam_idx] = 0
+                            cap = self.caps[cam_idx]
+                            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                            ok, frame = cap.read()
+                            if ok and frame is not None:
+                                self.last_pos[cam_idx] = frame_idx
+                        except Exception:
+                            ok = False
+                            frame = None
+                else:
+                    ok = False
+                    frame = None
+            if not ok or frame is None:
+                self.cap_fail_count[cam_idx] += 1
+                if self.cap_fail_count[cam_idx] > 5:
+                    self.cap_failed[cam_idx] = True
+                return None
+            # store in cache
+            cache[frame_idx] = frame
+            if len(cache) > self.cache_size:
+                cache.popitem(last=False)
+            return frame
+
+    def _try_transcode_once(self, cam_idx):
+        """Attempt to transcode the original path for cam_idx using ffmpeg.
+        Returns the path to the transcoded file on success, or None.
+        This is intentionally conservative: only one transcode attempt per camera.
+        """
+        try:
+            src = str(self.paths[cam_idx])
+        except Exception:
             return None
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
-        ok, frame = cap.read()
-        if not ok or frame is None:
+        if not os.path.exists(src):
             return None
-        cache[frame_idx] = frame
-        if len(cache) > self.cache_size:
-            cache.popitem(last=False)
-        return frame
+        if self.transcoded_paths[cam_idx]:
+            return self.transcoded_paths[cam_idx]
+        # create target temp path
+        base = Path(src).stem
+        out_dir = tempfile.gettempdir()
+        out_path = os.path.join(out_dir, f"{base}_transcoded.mp4")
+        if self.use_hwaccel:
+            # request hw-accelerated decode (cuda) and encode (nvenc) if available
+            cmd = [
+                'ffmpeg', '-y', '-v', 'error',
+                '-hwaccel', 'cuda', '-hwaccel_output_format', 'cuda',
+                '-i', src,
+                '-c:v', 'h264_nvenc', '-preset', 'fast', '-cq', '23',
+                '-c:a', 'aac', '-movflags', '+faststart', out_path
+            ]
+        else:
+            cmd = [
+                'ffmpeg', '-y', '-v', 'error', '-i', src,
+                '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+                '-c:a', 'aac', '-movflags', '+faststart', out_path
+            ]
+        try:
+            if self.use_hwaccel:
+                print(f"ffmpeg: transcoding with hwaccel {src} -> {out_path}")
+            else:
+                print(f"ffmpeg: transcoding {src} -> {out_path}")
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300)
+            if res.returncode == 0 and os.path.exists(out_path):
+                self.transcoded_paths[cam_idx] = out_path
+                return out_path
+            else:
+                print(f"ffmpeg failed for {src}: rc={res.returncode} stderr={res.stderr.decode(errors='ignore')}")
+        except Exception as e:
+            print(f"ffmpeg exception: {e}")
+        return None
+
+    def _prefetch_initial(self):
+        """Background prefetch: fill caches with the first N frames (round-robin) to
+        allow seeking back/forward immediately without heavy cap.set operations.
+        """
+        try:
+            # compute target per camera
+            targets = [min(self.cache_size, c) if c > 0 else 0 for c in self.frame_counts]
+            max_t = max(targets) if targets else 0
+            for f in range(max_t):
+                if self.prefetch_stop.is_set():
+                    break
+                for i, cap in enumerate(self.caps):
+                    if self.prefetch_stop.is_set():
+                        break
+                    if f >= targets[i]:
+                        continue
+                    if self.cap_failed[i] or cap is None:
+                        continue
+                    with self.cap_locks[i]:
+                        cache = self.caches[i]
+                        if f in cache:
+                            continue
+                        try:
+                            # if last_pos indicates we can read sequentially, do so
+                            if self.last_pos[i] == f - 1:
+                                ok, frame = cap.read()
+                                if ok and frame is not None:
+                                    self.last_pos[i] = f
+                                    cache[f] = frame
+                            else:
+                                cap.set(cv2.CAP_PROP_POS_FRAMES, f)
+                                ok, frame = cap.read()
+                                if ok and frame is not None:
+                                    self.last_pos[i] = f
+                                    cache[f] = frame
+                        except Exception:
+                            # mark failure and stop prefetch for this camera
+                            try:
+                                self.cap_fail_count[i] += 1
+                                if self.cap_fail_count[i] > 5:
+                                    self.cap_failed[i] = True
+                            except Exception:
+                                pass
+                        finally:
+                            if len(cache) > self.cache_size:
+                                # trim oldest
+                                try:
+                                    cache.popitem(last=False)
+                                except Exception:
+                                    pass
+        except Exception:
+            pass
+
+    def _ffmpeg_probe(self, path):
+        """Run a lightweight ffmpeg read to check for obvious decode errors.
+        Returns True if probe looks ok, False if ffmpeg reports decode errors.
+        """
+        try:
+            cmd = ['ffmpeg', '-v', 'error', '-i', str(path), '-f', 'null', '-']
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=30)
+            if res.returncode != 0:
+                # ffmpeg reported errors; consider this a bad file
+                return False
+            return True
+        except Exception:
+            return True
 
     @Slot(int)
     def step_request(self, n: int):
@@ -160,7 +413,21 @@ class VideoWorker(QThread):
         self.current_frame = max(0, self.current_frame + int(n))
         imgs = []
         for i, cap in enumerate(self.caps):
-            frame = self._get_frame(i, self.current_frame)
+            if self.cap_failed[i]:
+                imgs.append(None)
+                continue
+            try:
+                frame = self._get_frame(i, self.current_frame)
+            except Exception:
+                # mark failed and continue
+                try:
+                    self.cap_fail_count[i] += 1
+                    if self.cap_fail_count[i] > 5:
+                        self.cap_failed[i] = True
+                except Exception:
+                    pass
+                imgs.append(None)
+                continue
             if frame is None:
                 imgs.append(None)
             else:
@@ -250,6 +517,12 @@ class MainWindow(QWidget):
         btn_export = QPushButton('Exporter annotations (Excel)')
         btn_export.clicked.connect(self.export_annotations)
         self.gpu_checkbox = QCheckBox('Essayer GPU (si OpenCV CUDA disponible)')
+        # indicate GPU availability at startup
+        available = is_opencv_cuda_available()
+        print(f"OpenCV CUDA available: {available}")
+        self.gpu_checkbox.setChecked(True)
+        # connect checkbox to print changes
+        self.gpu_checkbox.stateChanged.connect(self.on_gpu_toggled)
         ann.addWidget(self.label_input)
         ann.addWidget(btn_add_label)
         ann.addWidget(self.gpu_checkbox)
@@ -273,7 +546,9 @@ class MainWindow(QWidget):
         if self.worker:
             self.worker.stop()
             self.worker.wait(200)
-        self.worker = VideoWorker(self.paths, cache_size=120)
+        use_hw = bool(self.gpu_checkbox.isChecked())
+        print(f"GPU checkbox requested: {use_hw}")
+        self.worker = VideoWorker(self.paths, cache_size=120, use_hwaccel=use_hw)
         self.worker.frames_ready.connect(self.on_frames)
         # connect the step signal to the worker slot (queued connection)
         try:
@@ -384,6 +659,14 @@ class MainWindow(QWidget):
             self.worker.stop()
             self.worker.wait(200)
         event.accept()
+
+    @Slot(int)
+    def on_gpu_toggled(self, state: int):
+        enabled = bool(state)
+        if enabled:
+            print('GPU requested by user (will be used if OpenCV CUDA is available).')
+        else:
+            print('GPU not requested; using CPU decoding.')
 
 
 def main():
