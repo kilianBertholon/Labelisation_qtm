@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QGridLayout, QVBoxLayout, QHBoxLayout,
     QPushButton, QFileDialog, QSlider, QLineEdit, QMessageBox, QCheckBox, QComboBox
 )
+from PySide6.QtWidgets import QTabWidget
 from PySide6.QtWidgets import QProgressBar
 from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
@@ -710,6 +711,15 @@ class MainWindow(QWidget):
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setEnabled(False)
         self.slider.valueChanged.connect(self.on_seek)
+        # unit display button (click to toggle between time/frame)
+        self.display_mode = 'time'  # 'time' or 'frame'
+        self.unit_btn = QPushButton('00:00.000')
+        try:
+            self.unit_btn.setFlat(True)
+            self.unit_btn.setFixedWidth(110)
+            self.unit_btn.clicked.connect(lambda: self._toggle_display_mode())
+        except Exception:
+            pass
         self.speed_box = QComboBox()
         self.speed_box.addItems(['0.25x', '0.5x', '1x', '2x'])
         self.speed_box.setCurrentText('1x')
@@ -719,6 +729,7 @@ class MainWindow(QWidget):
         ctrls.addWidget(self.btn_play)
         ctrls.addWidget(self.btn_next)
         ctrls.addWidget(self.slider)
+        ctrls.addWidget(self.unit_btn)
         ctrls.addWidget(self.speed_box)
         main.addLayout(ctrls)
 
@@ -730,6 +741,33 @@ class MainWindow(QWidget):
         main.addWidget(self.global_progress)
 
         self.setLayout(main)
+
+    def _toggle_display_mode(self):
+        try:
+            self.display_mode = 'frame' if getattr(self, 'display_mode', 'time') == 'time' else 'time'
+            self._refresh_unit_label()
+        except Exception:
+            pass
+
+    def _refresh_unit_label(self, frame_idx: int = None):
+        """Update the unit button text based on current display_mode and slider/frame index."""
+        try:
+            if frame_idx is None:
+                frame_idx = self.slider.value() if getattr(self, 'slider', None) else 0
+            fps = min(self.worker.fps) if self.worker and getattr(self.worker, 'fps', None) else 30.0
+            if getattr(self, 'display_mode', 'time') == 'time':
+                secs = frame_idx / max(1e-6, float(fps))
+                m = int(secs // 60)
+                s = secs - m * 60
+                txt = f"{m:02d}:{s:06.3f}"
+            else:
+                txt = f"Frame {int(frame_idx)}"
+            try:
+                self.unit_btn.setText(txt)
+            except Exception:
+                pass
+        except Exception:
+            pass
 
     @Slot()
     def load_videos(self):
@@ -801,6 +839,11 @@ class MainWindow(QWidget):
             self.slider.setValue(frame_idx)
         finally:
             self.slider.blockSignals(False)
+        # refresh unit label to reflect current frame/time
+        try:
+            self._refresh_unit_label(frame_idx)
+        except Exception:
+            pass
 
     @Slot()
     def toggle_play(self):
@@ -824,6 +867,10 @@ class MainWindow(QWidget):
             self.worker.seek(v)
             # emit current frame images immediately
             self.step_signal.emit(0)
+        try:
+            self._refresh_unit_label(v)
+        except Exception:
+            pass
 
     @Slot()
     def add_label(self):
@@ -1184,14 +1231,17 @@ class MainWindow(QWidget):
         event.accept()
 
     def open_settings(self):
-        """Open a simple settings dialog showing categories and defaults."""
+        """Open a tabbed settings dialog with: Général, Catalogue, Ajouter (quick add)."""
         try:
             dlg = QDialog(self)
             dlg.setWindowTitle('Paramètres')
-            layout = QVBoxLayout()
+            main_layout = QVBoxLayout()
 
-            # Left: settings categories (kept for backward compatibility)
-            top_h = QHBoxLayout()
+            tabs = QTabWidget()
+
+            # Tab: Général (categories + description)
+            gen_widget = QWidget()
+            gen_layout = QHBoxLayout()
             listw = QListWidget()
             for c in settings_catalog.list_categories():
                 listw.addItem(c)
@@ -1211,14 +1261,18 @@ class MainWindow(QWidget):
                     lines.append(f"  {kk} = {vv}")
                 txt.setPlainText('\n'.join(lines))
             listw.currentItemChanged.connect(lambda _i, _j: on_sel())
-            top_h.addWidget(listw, 1)
+            gen_layout.addWidget(listw, 1)
+            gen_layout.addWidget(txt, 2)
+            gen_widget.setLayout(gen_layout)
+            tabs.addTab(gen_widget, 'Général')
 
-            # Right: catalog editor
-            cat_editor_v = QVBoxLayout()
-            cat_editor_v.addWidget(QLabel('Éditeur du catalogue de labels'))
+            # Tab: Catalogue editor (replicates previous editor UI)
+            cat_widget = QWidget()
+            cat_v = QVBoxLayout()
+            cat_v.addWidget(QLabel('Éditeur du catalogue de labels'))
             editor_tree = QTreeWidget()
             editor_tree.setHeaderHidden(True)
-            editor_tree.setFixedHeight(240)
+            editor_tree.setFixedHeight(320)
             # populate from current main tree
             try:
                 data = self._tree_to_dict()
@@ -1234,7 +1288,7 @@ class MainWindow(QWidget):
                     add_obj(None, o)
             except Exception:
                 pass
-            cat_editor_v.addWidget(editor_tree)
+            cat_v.addWidget(editor_tree)
             edit_row = QHBoxLayout()
             edit_input = QLineEdit()
             edit_input.setPlaceholderText('Nom du label')
@@ -1248,8 +1302,7 @@ class MainWindow(QWidget):
             edit_row.addWidget(btn_e_add)
             edit_row.addWidget(btn_e_add_s)
             edit_row.addWidget(btn_e_del)
-            cat_editor_v.addLayout(edit_row)
-
+            cat_v.addLayout(edit_row)
             # save/load for editor
             sl = QHBoxLayout()
             btn_save = QPushButton('Sauvegarder')
@@ -1258,13 +1311,15 @@ class MainWindow(QWidget):
             btn_load.clicked.connect(lambda: self._editor_load(editor_tree))
             sl.addWidget(btn_save)
             sl.addWidget(btn_load)
-            cat_editor_v.addLayout(sl)
+            cat_v.addLayout(sl)
+            cat_widget.setLayout(cat_v)
+            tabs.addTab(cat_widget, 'Catalogue')
 
-            top_h.addLayout(cat_editor_v, 2)
-            top_h.addWidget(txt, 2)
-            layout.addLayout(top_h)
+            # (quick-add tab removed — utiliser l'éditeur Catalogue existant)
 
-            # bottom actions: Apply / Close
+            main_layout.addWidget(tabs)
+
+            # bottom actions: Apply / Close (apply uses editor_tree contents)
             actions = QHBoxLayout()
             btn_apply = QPushButton('Appliquer')
             btn_close = QPushButton('Fermer')
@@ -1273,9 +1328,9 @@ class MainWindow(QWidget):
             actions.addStretch()
             actions.addWidget(btn_apply)
             actions.addWidget(btn_close)
-            layout.addLayout(actions)
+            main_layout.addLayout(actions)
 
-            dlg.setLayout(layout)
+            dlg.setLayout(main_layout)
             dlg.resize(900, 500)
             dlg.exec()
         except Exception:

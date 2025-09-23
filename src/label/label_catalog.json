@@ -2,37 +2,85 @@
   {
     "name": "crawl",
     "children": [
-      { "name": "phase1" },
-      { "name": "phase2" },
-      { "name": "phase3" },
-      { "name": "phase4" }
+      {
+        "name": "phase2",
+        "children": []
+      },
+      {
+        "name": "phase3",
+        "children": []
+      },
+      {
+        "name": "phase4",
+        "children": []
+      },
+      {
+        "name": "glisse",
+        "children": []
+      }
     ]
   },
   {
     "name": "dos",
     "children": [
-      { "name": "phase1" },
-      { "name": "phase2" },
-      { "name": "phase3" },
-      { "name": "phase4" }
+      {
+        "name": "phase1",
+        "children": []
+      },
+      {
+        "name": "phase2",
+        "children": []
+      },
+      {
+        "name": "phase3",
+        "children": []
+      },
+      {
+        "name": "phase4",
+        "children": []
+      }
     ]
   },
   {
     "name": "papillon",
     "children": [
-      { "name": "phase1" },
-      { "name": "phase2" },
-      { "name": "phase3" },
-      { "name": "phase4" }
+      {
+        "name": "phase1",
+        "children": []
+      },
+      {
+        "name": "phase2",
+        "children": []
+      },
+      {
+        "name": "phase3",
+        "children": []
+      },
+      {
+        "name": "phase4",
+        "children": []
+      }
     ]
   },
   {
     "name": "brasse",
     "children": [
-      { "name": "phase1" },
-      { "name": "phase2" },
-      { "name": "phase3" },
-      { "name": "phase4" }
+      {
+        "name": "phase1",
+        "children": []
+      },
+      {
+        "name": "phase2",
+        "children": []
+      },
+      {
+        "name": "phase3",
+        "children": []
+      },
+      {
+        "name": "phase4",
+        "children": []
+      }
     ]
   }
 ]

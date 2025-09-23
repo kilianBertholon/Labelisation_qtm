@@ -1,0 +1,46 @@
+{
+  "display": {
+    "window_scale": 1.0,
+    "fit_mode": "keep_aspect",
+    "show_framerate": true
+  },
+  "playback": {
+    "playback_rate": 1.0,
+    "cache_size": 120,
+    "auto_prefetch": true
+  },
+  "transcode": {
+    "use_hwaccel": false,
+    "ffmpeg_path": "ffmpeg",
+    "keep_transcoded": false
+  },
+  "annotations": {
+    "export_format": "xlsx",
+    "include_camera_column": true
+  },
+  "shortcuts": {
+    "play_pause": "Return",
+    "prev_frame": "Left",
+    "next_frame": "Right",
+    "label:crawl": "C",
+    "label:crawl/phase2": "C, 1",
+    "label:crawl/phase3": "C, 3",
+    "label:crawl/phase4": "C, 4",
+    "label:crawl/glisse": "C, 2",
+    "label:dos": "D",
+    "label:dos/phase1": "D, 1",
+    "label:dos/phase2": "D, 2",
+    "label:dos/phase3": "D, 3",
+    "label:dos/phase4": "D, 4",
+    "label:papillon": "P",
+    "label:papillon/phase1": "P, 1",
+    "label:papillon/phase2": "P, 2",
+    "label:papillon/phase3": "P, 3",
+    "label:papillon/phase4": "P, 4",
+    "label:brasse": "B",
+    "label:brasse/phase1": "B, 1",
+    "label:brasse/phase2": "B, 2",
+    "label:brasse/phase3": "B, 3",
+    "label:brasse/phase4": "B, 4"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "display": {
+    "window_scale": 1.0,
+    "fit_mode": "keep_aspect",
+    "show_framerate": true
+  },
+  "playback": {
+    "playback_rate": 1.0,
+    "cache_size": 120,
+    "auto_prefetch": true
+  },
+  "transcode": {
+    "use_hwaccel": false,
+    "ffmpeg_path": "ffmpeg",
+    "keep_transcoded": false
+  },
+  "annotations": {
+    "export_format": "xlsx",
+    "include_camera_column": true
+  }
+}
