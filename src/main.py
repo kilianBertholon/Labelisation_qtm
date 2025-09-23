@@ -42,6 +42,13 @@ from PySide6.QtWidgets import (
 from PySide6.QtWidgets import QProgressBar
 from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
+from PySide6.QtWidgets import QDialog, QListWidget, QTextEdit, QVBoxLayout
+try:
+    # prefer absolute import so running `python src/main.py` works
+    from settings import catalog as settings_catalog
+except Exception:
+    # fallback to package-relative import when module is used as package
+    from .settings import catalog as settings_catalog
 
 try:
     import cv2
@@ -578,6 +585,14 @@ class MainWindow(QWidget):
 
     def init_ui(self):
         main = QVBoxLayout()
+        # settings toolbar
+        toolbar = QHBoxLayout()
+        btn_settings = QPushButton('Paramètres')
+        btn_settings.clicked.connect(self.open_settings)
+        toolbar.addWidget(btn_settings)
+        # place toolbar at top
+        main.addLayout(toolbar)
+
         grid = QGridLayout()
         for i in range(6):
             lbl = QLabel(f"Cam {i+1}\n(aucune vidéo)")
@@ -790,6 +805,39 @@ class MainWindow(QWidget):
         except Exception:
             pass
         event.accept()
+
+    def open_settings(self):
+        """Open a simple settings dialog showing categories and defaults."""
+        try:
+            dlg = QDialog(self)
+            dlg.setWindowTitle('Paramètres')
+            layout = QVBoxLayout()
+            listw = QListWidget()
+            for c in settings_catalog.list_categories():
+                listw.addItem(c)
+            txt = QTextEdit()
+            txt.setReadOnly(True)
+            def on_sel():
+                it = listw.currentItem()
+                if not it:
+                    txt.setPlainText('')
+                    return
+                cat = it.text()
+                desc = settings_catalog.describe(cat) or []
+                lines = [f"{k}: {d}" for k, d in desc]
+                vals = settings_catalog.get_defaults(cat) or {}
+                lines.append('\nDefaults:')
+                for kk, vv in vals.items():
+                    lines.append(f"  {kk} = {vv}")
+                txt.setPlainText('\n'.join(lines))
+            listw.currentItemChanged.connect(lambda _i, _j: on_sel())
+            layout.addWidget(listw)
+            layout.addWidget(txt)
+            dlg.setLayout(layout)
+            dlg.resize(600, 400)
+            dlg.exec()
+        except Exception:
+            pass
 
     @Slot(int)
     def on_gpu_toggled(self, state: int):
