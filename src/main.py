@@ -43,7 +43,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtWidgets import QToolTip
 from PySide6.QtWidgets import QTabWidget
 from PySide6.QtWidgets import QProgressBar
-from PySide6.QtCore import Qt, QThread, Signal, Slot
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QEvent
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush
 from PySide6.QtWidgets import QDialog, QListWidget, QTextEdit, QVBoxLayout, QListWidgetItem
 from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
@@ -185,6 +185,147 @@ class TimelineWidget(QWidget):
                 pass
         finally:
             qp.end()
+
+
+    class VideoPopup(QWidget):
+        """Popup window that shows a single camera view with pan & zoom support.
+        Use set_qimage(QImage) to update the displayed frame; it stays in sync with
+        the main window if updated from `on_frames`.
+        """
+        def __init__(self, parent=None, title='Video'):
+            super().__init__(parent)
+            # make popup a top-level resizable window by default
+            try:
+                self.setWindowFlags(Qt.Window | Qt.WindowTitleHint | Qt.WindowCloseButtonHint)
+            except Exception:
+                pass
+            self.setWindowTitle(title)
+            # main layout with small control bar on top
+            self.layout = QVBoxLayout()
+            ctrl = QHBoxLayout()
+            self.btn_close = QPushButton('Fermer')
+            self.btn_close.setFixedWidth(80)
+            self.btn_close.clicked.connect(self.close)
+            self.btn_reset = QPushButton('Reset zoom')
+            self.btn_reset.setFixedWidth(100)
+            self.btn_reset.clicked.connect(self._reset_zoom)
+            ctrl.addStretch()
+            ctrl.addWidget(self.btn_reset)
+            ctrl.addWidget(self.btn_close)
+            self.layout.addLayout(ctrl)
+            self.lbl = QLabel('')
+            self.lbl.setAlignment(Qt.AlignCenter)
+            self.layout.addWidget(self.lbl)
+            self.setLayout(self.layout)
+            self._pix = None  # original QPixmap
+            self._scale = 1.0
+            self._dragging = False
+            self._last_pos = None
+            self._offset = [0, 0]
+            self.setMinimumSize(320, 240)
+
+        def set_qimage(self, qimage: QImage):
+            try:
+                if qimage is None:
+                    return
+                pix = QPixmap.fromImage(qimage)
+                self._pix = pix
+                self._ensure_visible()
+            except Exception:
+                pass
+
+        def _reset_zoom(self):
+            try:
+                self._scale = 1.0
+                self._offset = [0, 0]
+                self._ensure_visible()
+            except Exception:
+                pass
+
+        def keyPressEvent(self, event):
+            try:
+                # allow Esc to close the popup quickly
+                if hasattr(event, 'key') and event.key() == Qt.Key_Escape:
+                    self.close()
+                    return
+            except Exception:
+                pass
+            return super().keyPressEvent(event)
+
+        def _ensure_visible(self):
+            try:
+                if self._pix is None:
+                    return
+                pw = self._pix.width()
+                ph = self._pix.height()
+                w = max(1, self.width())
+                h = max(1, self.height())
+                sw = int(pw * self._scale)
+                sh = int(ph * self._scale)
+                if sw <= 0 or sh <= 0:
+                    return
+                disp = self._pix.scaled(sw, sh, Qt.KeepAspectRatio)
+                # create an empty pixmap of the widget size and draw the scaled pix at offset
+                canvas = QPixmap(w, h)
+                canvas.fill(QColor(30, 30, 30))
+                painter = QPainter(canvas)
+                try:
+                    x = self._offset[0]
+                    y = self._offset[1]
+                    painter.drawPixmap(x, y, disp)
+                finally:
+                    painter.end()
+                self.lbl.setPixmap(canvas)
+            except Exception:
+                pass
+
+        def wheelEvent(self, event):
+            try:
+                delta = event.angleDelta().y()
+                if delta > 0:
+                    self._scale *= 1.1
+                else:
+                    self._scale /= 1.1
+                self._scale = max(0.1, min(10.0, self._scale))
+                self._ensure_visible()
+            except Exception:
+                pass
+
+        def mousePressEvent(self, event):
+            try:
+                if event.button() == Qt.LeftButton:
+                    self._dragging = True
+                    self._last_pos = event.position().toPoint() if hasattr(event, 'position') else event.pos()
+            except Exception:
+                pass
+
+        def mouseMoveEvent(self, event):
+            try:
+                if not self._dragging or self._last_pos is None:
+                    return
+                pos = event.position().toPoint() if hasattr(event, 'position') else event.pos()
+                dx = pos.x() - self._last_pos.x()
+                dy = pos.y() - self._last_pos.y()
+                self._offset[0] += dx
+                self._offset[1] += dy
+                self._last_pos = pos
+                self._ensure_visible()
+            except Exception:
+                pass
+
+        def mouseReleaseEvent(self, event):
+            try:
+                if event.button() == Qt.LeftButton:
+                    self._dragging = False
+                    self._last_pos = None
+            except Exception:
+                pass
+
+        def resizeEvent(self, event):
+            try:
+                self._ensure_visible()
+            except Exception:
+                pass
 
     def mouseMoveEvent(self, event):
         try:
@@ -859,6 +1000,10 @@ class MainWindow(QWidget):
             lbl.setStyleSheet("background: #000; color: #fff; border: 1px solid #444;")
             self.video_grid.addWidget(lbl, i // 3, i % 3)
             self.video_labels.append(lbl)
+            try:
+                lbl.installEventFilter(self)
+            except Exception:
+                pass
         self.right_widget = QWidget()
         right_layout = QVBoxLayout()
         right_layout.addLayout(self.video_grid)
@@ -875,6 +1020,9 @@ class MainWindow(QWidget):
             self.timeline = None
         self.right_widget.setLayout(right_layout)
         content.addWidget(self.right_widget, stretch=1)
+
+        # popup windows per camera (index->VideoPopup)
+        self.popups = {}
 
         main.addLayout(content)
 
@@ -1057,6 +1205,73 @@ class MainWindow(QWidget):
                     self.timeline.set_current_frame(frame_idx)
                 except Exception:
                     pass
+        except Exception:
+            pass
+        # update any open popups with the corresponding camera frames
+        try:
+            for cam_idx, popup in list((self.popups or {}).items()):
+                try:
+                    if 0 <= cam_idx < len(qimages):
+                        img = qimages[cam_idx]
+                        if img is not None and popup:
+                            popup.set_qimage(img)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def eventFilter(self, obj, event):
+        """Intercept double-clicks on video labels to open a zoom popup."""
+        try:
+            if event.type() == QEvent.MouseButtonDblClick:
+                # if the clicked object is one of our video labels, open popup
+                if obj in getattr(self, 'video_labels', []):
+                    try:
+                        cam_idx = self.video_labels.index(obj)
+                        self.open_popup_for_camera(cam_idx)
+                        return True
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return super().eventFilter(obj, event)
+
+    def open_popup_for_camera(self, cam_idx: int):
+        """Open (or focus) a VideoPopup for camera index cam_idx (0-based).
+
+        Usage:
+        - double-click a video tile in the UI
+        - or call `main_window.open_popup_for_camera(0)` to open camera 1 programmatically
+        """
+        try:
+            if cam_idx in (self.popups or {}) and self.popups.get(cam_idx):
+                # already open -> raise
+                try:
+                    p = self.popups[cam_idx]
+                    p.raise_()
+                    p.activateWindow()
+                except Exception:
+                    pass
+                return
+            popup = TimelineWidget.VideoPopup(self, title=f"Cam {cam_idx+1}")
+            try:
+                popup.setAttribute(Qt.WA_DeleteOnClose, True)
+            except Exception:
+                pass
+            # remove reference when popup is destroyed
+            try:
+                popup.destroyed.connect(lambda _=None, idx=cam_idx: self.popups.pop(idx, None))
+            except Exception:
+                pass
+            self.popups[cam_idx] = popup
+            # try to show current thumbnail immediately
+            try:
+                pm = self.video_labels[cam_idx].pixmap()
+                if pm:
+                    popup.set_qimage(pm.toImage())
+            except Exception:
+                pass
+            popup.show()
         except Exception:
             pass
 
