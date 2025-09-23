@@ -34,6 +34,7 @@ import subprocess
 import tempfile
 import os
 import threading
+import json
 
 from PySide6.QtWidgets import (
     QApplication, QWidget, QLabel, QGridLayout, QVBoxLayout, QHBoxLayout,
@@ -43,6 +44,7 @@ from PySide6.QtWidgets import QProgressBar
 from PySide6.QtCore import Qt, QThread, Signal, Slot
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QDialog, QListWidget, QTextEdit, QVBoxLayout
+from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
 try:
     # prefer absolute import so running `python src/main.py` works
     from settings import catalog as settings_catalog
@@ -585,27 +587,115 @@ class MainWindow(QWidget):
 
     def init_ui(self):
         main = QVBoxLayout()
-        # settings toolbar
-        toolbar = QHBoxLayout()
+
+        # Main content: left panel + right video grid
+        content = QHBoxLayout()
+
+        # estimate left panel width as 10% of primary screen width (min 240)
+        try:
+            screen = QApplication.primaryScreen()
+            sw = screen.size().width() if screen else 1200
+        except Exception:
+            sw = 1200
+        self.left_w = max(240, int(sw * 0.10))
+
+        # Left panel (parameters, annotations, export)
+        self.left_panel = QWidget()
+        left_layout = QVBoxLayout()
+        # collapse button row (kept inside panel)
+        htop = QHBoxLayout()
+        lbl_side = QLabel('Panneau')
+        btn_collapse = QPushButton('<<')
+        btn_collapse.setFixedWidth(32)
+        btn_collapse.clicked.connect(self.toggle_left_panel)
+        htop.addWidget(lbl_side)
+        htop.addStretch()
+        htop.addWidget(btn_collapse)
+        left_layout.addLayout(htop)
+
+        # settings button
         btn_settings = QPushButton('Paramètres')
         btn_settings.clicked.connect(self.open_settings)
-        toolbar.addWidget(btn_settings)
-        # place toolbar at top
-        main.addLayout(toolbar)
+        left_layout.addWidget(btn_settings)
 
-        grid = QGridLayout()
+        # quick label creation (input + add button)
+        left_layout.addWidget(QLabel('Nouveau label'))
+        hadd = QHBoxLayout()
+        self.label_input = QLineEdit()
+        self.label_input.setPlaceholderText('Texte du label...')
+        # allow Enter to add
+        try:
+            self.label_input.returnPressed.connect(self.add_label)
+        except Exception:
+            pass
+        btn_add_label = QPushButton('Ajouter')
+        btn_add_label.clicked.connect(self.add_label)
+        hadd.addWidget(self.label_input)
+        hadd.addWidget(btn_add_label)
+        left_layout.addLayout(hadd)
+
+        # Label catalog (read-only view) - editing moved to Paramètres
+        left_layout.addWidget(QLabel('Catalogue de labels'))
+        self.label_tree = QTreeWidget()
+        self.label_tree.setHeaderHidden(True)
+        self.label_tree.setFixedHeight(180)
+        left_layout.addWidget(self.label_tree)
+        left_layout.addWidget(QLabel("(Édition des labels: Paramètres → Catalogue)") )
+        # default catalog path
+        try:
+            self.catalog_path = Path.cwd() / 'label_catalog.json'
+        except Exception:
+            self.catalog_path = Path('label_catalog.json')
+        # try to auto-load existing catalog (silent)
+        try:
+            self.load_catalog_from_json(silent=True)
+        except Exception:
+            pass
+
+        # annotations list and controls
+        left_layout.addWidget(QLabel('Annotations'))
+        self.ann_list = QListWidget()
+        self.ann_list.itemDoubleClicked.connect(self.on_annotation_double_click)
+        left_layout.addWidget(self.ann_list)
+        hann = QHBoxLayout()
+        btn_delete_ann = QPushButton('Supprimer')
+        btn_delete_ann.clicked.connect(self.delete_selected_annotation)
+        btn_export_ann = QPushButton('Exporter')
+        btn_export_ann.clicked.connect(self.export_annotations)
+        hann.addWidget(btn_delete_ann)
+        hann.addWidget(btn_export_ann)
+        left_layout.addLayout(hann)
+
+        self.left_panel.setLayout(left_layout)
+        # initial width for the left panel
+        self.left_panel.setFixedWidth(self.left_w)
+        content.addWidget(self.left_panel)
+
+        # Right: video grid (create once and keep as attributes to avoid double-parenting)
+        self.video_grid = QGridLayout()
         for i in range(6):
             lbl = QLabel(f"Cam {i+1}\n(aucune vidéo)")
             lbl.setFixedSize(480, 360)
             lbl.setAlignment(Qt.AlignCenter)
             lbl.setStyleSheet("background: #000; color: #fff; border: 1px solid #444;")
-            grid.addWidget(lbl, i // 3, i % 3)
+            self.video_grid.addWidget(lbl, i // 3, i % 3)
             self.video_labels.append(lbl)
+        self.right_widget = QWidget()
+        right_layout = QVBoxLayout()
+        right_layout.addLayout(self.video_grid)
+        self.right_widget.setLayout(right_layout)
+        content.addWidget(self.right_widget, stretch=1)
 
-        main.addLayout(grid)
+        main.addLayout(content)
 
-        # Controls
+        # Controls bar at bottom (load, prev, play, next, seek, speed)
         ctrls = QHBoxLayout()
+        # Toggle button to show/hide the left panel even when it's closed
+        self.btn_toggle_side = QPushButton('Panneau')
+        self.btn_toggle_side.setFixedWidth(80)
+        self.btn_toggle_side.clicked.connect(self.toggle_left_panel)
+        ctrls.addWidget(self.btn_toggle_side)
+
         btn_load = QPushButton('Charger 6 vidéos')
         btn_load.clicked.connect(self.load_videos)
         self.btn_prev = QPushButton('◀')
@@ -624,7 +714,6 @@ class MainWindow(QWidget):
         self.speed_box.addItems(['0.25x', '0.5x', '1x', '2x'])
         self.speed_box.setCurrentText('1x')
         self.speed_box.currentTextChanged.connect(self.on_speed_changed)
-
         ctrls.addWidget(btn_load)
         ctrls.addWidget(self.btn_prev)
         ctrls.addWidget(self.btn_play)
@@ -633,28 +722,7 @@ class MainWindow(QWidget):
         ctrls.addWidget(self.speed_box)
         main.addLayout(ctrls)
 
-        # Annotation controls
-        ann = QHBoxLayout()
-        self.label_input = QLineEdit()
-        self.label_input.setPlaceholderText('Label (ex: walking, error...)')
-        btn_add_label = QPushButton('Ajouter label (cam active)')
-        btn_add_label.clicked.connect(self.add_label)
-        btn_export = QPushButton('Exporter annotations (Excel)')
-        btn_export.clicked.connect(self.export_annotations)
-        self.gpu_checkbox = QCheckBox('Essayer GPU (si OpenCV CUDA disponible)')
-        # indicate GPU availability at startup
-        available = is_opencv_cuda_available()
-        print(f"OpenCV CUDA available: {available}")
-        self.gpu_checkbox.setChecked(True)
-        # connect checkbox to print changes
-        self.gpu_checkbox.stateChanged.connect(self.on_gpu_toggled)
-        ann.addWidget(self.label_input)
-        ann.addWidget(btn_add_label)
-        ann.addWidget(self.gpu_checkbox)
-        ann.addWidget(btn_export)
-        main.addLayout(ann)
-
-    # Global transcode progress bar (hidden until used)
+        # Global transcode progress bar (hidden until used)
         self.global_progress = QProgressBar()
         self.global_progress.setRange(0, 100)
         self.global_progress.setValue(0)
@@ -678,8 +746,9 @@ class MainWindow(QWidget):
         if self.worker:
             self.worker.stop()
             self.worker.wait(200)
-        use_hw = bool(self.gpu_checkbox.isChecked())
-        print(f"GPU checkbox requested: {use_hw}")
+        # GPU checkbox removed from UI; enable hwaccel by default if available
+        use_hw = True
+        print(f"GPU requested by default: {use_hw}")
         self.worker = VideoWorker(self.paths, cache_size=120, use_hwaccel=use_hw)
         self.worker.frames_ready.connect(self.on_frames)
         try:
@@ -758,17 +827,275 @@ class MainWindow(QWidget):
 
     @Slot()
     def add_label(self):
-        txt = self.label_input.text().strip()
+        # prefer label from selected catalog node if any
+        sel = None
+        try:
+            it = self.label_tree.currentItem()
+            if it:
+                sel = it.text(0)
+        except Exception:
+            sel = None
+        txt = self.label_input.text().strip() if getattr(self, 'label_input', None) else ''
+        if not txt and sel:
+            txt = sel
         if not txt:
             QMessageBox.information(self, 'Info', 'Saisir un texte pour le label avant d\'ajouter.')
             return
         current = self.slider.value()
         fps = min(self.worker.fps) if self.worker and self.worker.fps else 30.0
         t = current / fps
+        # add annotation per camera and reflect in the left panel list
         for i in range(len(self.paths)):
             ann = Annotation(cam=i+1, frame_idx=current, time_sec=t, label=txt)
             self.annotations.append(ann)
+            try:
+                item_text = f"{i+1}|{current}|{t:.3f}|{txt}"
+                self.ann_list.addItem(item_text)
+            except Exception:
+                pass
+        # clear input for convenience
+        try:
+            if getattr(self, 'label_input', None):
+                self.label_input.clear()
+        except Exception:
+            pass
         QMessageBox.information(self, 'Annotation', f'Label "{txt}" ajouté au frame {current} ({t:.3f}s) pour {len(self.paths)} cam(s).')
+
+    # ----- catalog management methods -----
+    def add_catalog_label(self):
+        name = self.catalog_input.text().strip() if getattr(self, 'catalog_input', None) else ''
+        if not name:
+            QMessageBox.information(self, 'Info', 'Saisir un nom pour le label à créer.')
+            return
+        try:
+            item = QTreeWidgetItem([name])
+            self.label_tree.addTopLevelItem(item)
+            self.catalog_input.clear()
+        except Exception:
+            pass
+
+    def add_catalog_sublabel(self):
+        name = self.catalog_input.text().strip() if getattr(self, 'catalog_input', None) else ''
+        it = None
+        try:
+            it = self.label_tree.currentItem()
+        except Exception:
+            it = None
+        if not it:
+            QMessageBox.information(self, 'Info', 'Sélectionner un label parent dans le catalogue pour ajouter un sous-label.')
+            return
+        if not name:
+            QMessageBox.information(self, 'Info', 'Saisir un nom pour le sous-label.')
+            return
+        try:
+            child = QTreeWidgetItem([name])
+            it.addChild(child)
+            it.setExpanded(True)
+            self.catalog_input.clear()
+        except Exception:
+            pass
+
+    def delete_catalog_label(self):
+        it = None
+        try:
+            it = self.label_tree.currentItem()
+        except Exception:
+            it = None
+        if not it:
+            return
+        try:
+            parent = it.parent()
+            if parent:
+                parent.removeChild(it)
+            else:
+                idx = self.label_tree.indexOfTopLevelItem(it)
+                if idx >= 0:
+                    self.label_tree.takeTopLevelItem(idx)
+        except Exception:
+            pass
+
+    def _tree_to_dict(self):
+        """Return a serializable dict representation of the label_tree."""
+        def item_to_obj(it):
+            obj = {'name': it.text(0), 'children': []}
+            for i in range(it.childCount()):
+                obj['children'].append(item_to_obj(it.child(i)))
+            return obj
+        out = []
+        for i in range(self.label_tree.topLevelItemCount()):
+            out.append(item_to_obj(self.label_tree.topLevelItem(i)))
+        return out
+
+    def _dict_to_tree(self, data):
+        """Populate label_tree from dict/list structure created by _tree_to_dict."""
+        self.label_tree.clear()
+        def add_obj(parent, obj):
+            it = QTreeWidgetItem([obj.get('name', '')])
+            if parent is None:
+                self.label_tree.addTopLevelItem(it)
+            else:
+                parent.addChild(it)
+            for c in obj.get('children', []) or []:
+                add_obj(it, c)
+        for o in data or []:
+            add_obj(None, o)
+
+    def save_catalog_to_json(self):
+        try:
+            data = self._tree_to_dict()
+            p = QFileDialog.getSaveFileName(self, 'Enregistrer catalogue', str(self.catalog_path), 'JSON (*.json)')
+            if not p or not p[0]:
+                return
+            path = p[0]
+            with open(path, 'w', encoding='utf8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            QMessageBox.information(self, 'Sauvegardé', f'Catalogue sauvegardé: {path}')
+        except Exception as e:
+            QMessageBox.critical(self, 'Erreur', f'Impossible de sauvegarder le catalogue: {e}')
+
+    def load_catalog_from_json(self, silent=False):
+        try:
+            if silent:
+                path = str(self.catalog_path)
+            else:
+                p = QFileDialog.getOpenFileName(self, 'Charger catalogue', str(self.catalog_path), 'JSON (*.json)')
+                if not p or not p[0]:
+                    return
+                path = p[0]
+            if not os.path.exists(path):
+                # try fallback locations (e.g. src/label/label_catalog.json)
+                try:
+                    candidate = Path(__file__).resolve().parent / 'label' / 'label_catalog.json'
+                    if candidate.exists():
+                        path = str(candidate)
+                    else:
+                        # also try repository root src/label
+                        candidate2 = Path.cwd() / 'src' / 'label' / 'label_catalog.json'
+                        if candidate2.exists():
+                            path = str(candidate2)
+                except Exception:
+                    pass
+            if not os.path.exists(path):
+                if not silent:
+                    QMessageBox.information(self, 'Vide', 'Fichier de catalogue introuvable.')
+                return
+            with open(path, 'r', encoding='utf8') as f:
+                data = json.load(f)
+            self._dict_to_tree(data)
+            if not silent:
+                QMessageBox.information(self, 'Chargé', f'Catalogue chargé: {path}')
+        except Exception as e:
+            if not silent:
+                QMessageBox.critical(self, 'Erreur', f'Impossible de charger le catalogue: {e}')
+
+    # --------- editor dialog helpers ---------
+    def _editor_add_label(self, tree: QTreeWidget, input_widget: QLineEdit):
+        name = input_widget.text().strip() if input_widget else ''
+        if not name:
+            QMessageBox.information(self, 'Info', 'Saisir un nom pour le label.')
+            return
+        try:
+            it = QTreeWidgetItem([name])
+            tree.addTopLevelItem(it)
+            input_widget.clear()
+        except Exception:
+            pass
+
+    def _editor_add_sublabel(self, tree: QTreeWidget, input_widget: QLineEdit):
+        name = input_widget.text().strip() if input_widget else ''
+        it = tree.currentItem() if tree else None
+        if not it:
+            QMessageBox.information(self, 'Info', 'Sélectionner un label parent.')
+            return
+        if not name:
+            QMessageBox.information(self, 'Info', 'Saisir un nom pour le sous-label.')
+            return
+        try:
+            child = QTreeWidgetItem([name])
+            it.addChild(child)
+            it.setExpanded(True)
+            input_widget.clear()
+        except Exception:
+            pass
+
+    def _editor_delete_item(self, tree: QTreeWidget):
+        it = tree.currentItem() if tree else None
+        if not it:
+            return
+        try:
+            parent = it.parent()
+            if parent:
+                parent.removeChild(it)
+            else:
+                idx = tree.indexOfTopLevelItem(it)
+                if idx >= 0:
+                    tree.takeTopLevelItem(idx)
+        except Exception:
+            pass
+
+    def _editor_save(self, tree: QTreeWidget):
+        # reuse dialog to save to JSON
+        try:
+            data = []
+            def item_to_obj(it):
+                o = {'name': it.text(0), 'children': []}
+                for i in range(it.childCount()):
+                    o['children'].append(item_to_obj(it.child(i)))
+                return o
+            for i in range(tree.topLevelItemCount()):
+                data.append(item_to_obj(tree.topLevelItem(i)))
+            p = QFileDialog.getSaveFileName(self, 'Enregistrer catalogue', str(self.catalog_path), 'JSON (*.json)')
+            if not p or not p[0]:
+                return
+            path = p[0]
+            with open(path, 'w', encoding='utf8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            QMessageBox.information(self, 'Sauvegardé', f'Catalogue sauvegardé: {path}')
+        except Exception as e:
+            QMessageBox.critical(self, 'Erreur', f'Impossible de sauvegarder: {e}')
+
+    def _editor_load(self, tree: QTreeWidget):
+        try:
+            p = QFileDialog.getOpenFileName(self, 'Charger catalogue', str(self.catalog_path), 'JSON (*.json)')
+            if not p or not p[0]:
+                return
+            path = p[0]
+            if not os.path.exists(path):
+                QMessageBox.information(self, 'Vide', 'Fichier introuvable')
+                return
+            with open(path, 'r', encoding='utf8') as f:
+                data = json.load(f)
+            # populate tree
+            tree.clear()
+            def add_obj(parent, obj):
+                it = QTreeWidgetItem([obj.get('name', '')])
+                if parent is None:
+                    tree.addTopLevelItem(it)
+                else:
+                    parent.addChild(it)
+                for c in obj.get('children', []) or []:
+                    add_obj(it, c)
+            for o in data or []:
+                add_obj(None, o)
+        except Exception as e:
+            QMessageBox.critical(self, 'Erreur', f'Impossible de charger: {e}')
+
+    def _apply_catalog_from_editor(self, tree: QTreeWidget):
+        try:
+            # serialize editor tree then rebuild main tree
+            def item_to_obj(it):
+                o = {'name': it.text(0), 'children': []}
+                for i in range(it.childCount()):
+                    o['children'].append(item_to_obj(it.child(i)))
+                return o
+            data = []
+            for i in range(tree.topLevelItemCount()):
+                data.append(item_to_obj(tree.topLevelItem(i)))
+            # apply to main tree
+            self._dict_to_tree(data)
+            QMessageBox.information(self, 'Appliqué', 'Catalogue appliqué.')
+        except Exception:
+            pass
 
     @Slot()
     def export_annotations(self):
@@ -781,9 +1108,17 @@ class MainWindow(QWidget):
         path, _ = QFileDialog.getSaveFileName(self, 'Enregistrer annotations', str(Path.cwd() / 'annotations.xlsx'), 'Excel (*.xlsx)')
         if not path:
             return
+        # build rows with separate 'label' and 'sublabel' when hierarchy exists
         rows = []
         for a in self.annotations:
-            rows.append({'camera': a.cam, 'frame': a.frame_idx, 'time_s': a.time_sec, 'label': a.label})
+            top, sub = self._find_label_hierarchy(a.label)
+            if sub:
+                lab = top or ''
+                sublab = sub or ''
+            else:
+                lab = top or a.label or ''
+                sublab = ''
+            rows.append({'camera': a.cam, 'frame': a.frame_idx, 'time_s': a.time_sec, 'label': lab, 'sublabel': sublab})
         df = pd.DataFrame(rows)
         try:
             df.to_excel(path, index=False)
@@ -791,6 +1126,48 @@ class MainWindow(QWidget):
             QMessageBox.critical(self, 'Erreur', f'Impossible d\'écrire le fichier: {e}')
             return
         QMessageBox.information(self, 'Exporté', f'Annotations exportées vers: {path}')
+
+    def _find_label_hierarchy(self, label_text: str):
+        """Return (top_label, sublabel) based on current label_tree.
+        If label_text matches a top-level name, returns (label_text, None).
+        If it matches a descendant, returns (top_level_name, joined_subpath).
+        If not found, returns (label_text, None).
+        """
+        if not label_text:
+            return (None, None)
+        try:
+            # iterate top-level items
+            for i in range(self.label_tree.topLevelItemCount()):
+                top = self.label_tree.topLevelItem(i)
+                top_name = top.text(0)
+                if top_name == label_text:
+                    return (top_name, None)
+                # search recursively under this top
+                def search(node):
+                    for j in range(node.childCount()):
+                        child = node.child(j)
+                        name = child.text(0)
+                        if name == label_text:
+                            # build subpath from child up to but excluding top
+                            path = [name]
+                            p = child.parent()
+                            while p is not None and p is not top:
+                                path.insert(0, p.text(0))
+                                p = p.parent()
+                            # joined subpath (excluding top)
+                            return '/'.join(path) if path else name
+                        # deeper
+                        res = search(child)
+                        if res:
+                            return res
+                    return None
+                sub = search(top)
+                if sub:
+                    return (top_name, sub)
+        except Exception:
+            pass
+        # fallback: not found
+        return (label_text, None)
 
     def closeEvent(self, event):
         if self.worker:
@@ -812,6 +1189,9 @@ class MainWindow(QWidget):
             dlg = QDialog(self)
             dlg.setWindowTitle('Paramètres')
             layout = QVBoxLayout()
+
+            # Left: settings categories (kept for backward compatibility)
+            top_h = QHBoxLayout()
             listw = QListWidget()
             for c in settings_catalog.list_categories():
                 listw.addItem(c)
@@ -831,11 +1211,115 @@ class MainWindow(QWidget):
                     lines.append(f"  {kk} = {vv}")
                 txt.setPlainText('\n'.join(lines))
             listw.currentItemChanged.connect(lambda _i, _j: on_sel())
-            layout.addWidget(listw)
-            layout.addWidget(txt)
+            top_h.addWidget(listw, 1)
+
+            # Right: catalog editor
+            cat_editor_v = QVBoxLayout()
+            cat_editor_v.addWidget(QLabel('Éditeur du catalogue de labels'))
+            editor_tree = QTreeWidget()
+            editor_tree.setHeaderHidden(True)
+            editor_tree.setFixedHeight(240)
+            # populate from current main tree
+            try:
+                data = self._tree_to_dict()
+                def add_obj(parent, obj):
+                    it = QTreeWidgetItem([obj.get('name', '')])
+                    if parent is None:
+                        editor_tree.addTopLevelItem(it)
+                    else:
+                        parent.addChild(it)
+                    for c in obj.get('children', []) or []:
+                        add_obj(it, c)
+                for o in data or []:
+                    add_obj(None, o)
+            except Exception:
+                pass
+            cat_editor_v.addWidget(editor_tree)
+            edit_row = QHBoxLayout()
+            edit_input = QLineEdit()
+            edit_input.setPlaceholderText('Nom du label')
+            btn_e_add = QPushButton('Ajouter label')
+            btn_e_add.clicked.connect(lambda: self._editor_add_label(editor_tree, edit_input))
+            btn_e_add_s = QPushButton('Ajouter sous-label')
+            btn_e_add_s.clicked.connect(lambda: self._editor_add_sublabel(editor_tree, edit_input))
+            btn_e_del = QPushButton('Supprimer')
+            btn_e_del.clicked.connect(lambda: self._editor_delete_item(editor_tree))
+            edit_row.addWidget(edit_input)
+            edit_row.addWidget(btn_e_add)
+            edit_row.addWidget(btn_e_add_s)
+            edit_row.addWidget(btn_e_del)
+            cat_editor_v.addLayout(edit_row)
+
+            # save/load for editor
+            sl = QHBoxLayout()
+            btn_save = QPushButton('Sauvegarder')
+            btn_save.clicked.connect(lambda: self._editor_save(editor_tree))
+            btn_load = QPushButton('Charger')
+            btn_load.clicked.connect(lambda: self._editor_load(editor_tree))
+            sl.addWidget(btn_save)
+            sl.addWidget(btn_load)
+            cat_editor_v.addLayout(sl)
+
+            top_h.addLayout(cat_editor_v, 2)
+            top_h.addWidget(txt, 2)
+            layout.addLayout(top_h)
+
+            # bottom actions: Apply / Close
+            actions = QHBoxLayout()
+            btn_apply = QPushButton('Appliquer')
+            btn_close = QPushButton('Fermer')
+            btn_apply.clicked.connect(lambda: self._apply_catalog_from_editor(editor_tree))
+            btn_close.clicked.connect(dlg.accept)
+            actions.addStretch()
+            actions.addWidget(btn_apply)
+            actions.addWidget(btn_close)
+            layout.addLayout(actions)
+
             dlg.setLayout(layout)
-            dlg.resize(600, 400)
+            dlg.resize(900, 500)
             dlg.exec()
+        except Exception:
+            pass
+
+    def toggle_left_panel(self):
+        """Show/hide the left panel."""
+        try:
+            vis = self.left_panel.isVisible()
+            self.left_panel.setVisible(not vis)
+        except Exception:
+            pass
+
+    def delete_selected_annotation(self):
+        try:
+            idx = self.ann_list.currentRow()
+            if idx < 0:
+                return
+            # remove from annotations model (assume 1-to-1 ordering)
+            if 0 <= idx < len(self.annotations):
+                del self.annotations[idx]
+            self.ann_list.takeItem(idx)
+        except Exception:
+            pass
+
+    def on_annotation_double_click(self, item):
+        """Double-clicking an annotation jumps to the frame for that camera.
+        Item text format: 'cam|frame|time|label'
+        """
+        try:
+            txt = item.text()
+            parts = txt.split('|')
+            if len(parts) < 2:
+                return
+            cam = int(parts[0])
+            frame = int(parts[1])
+            # set slider and request frame
+            try:
+                self.slider.setValue(frame)
+            except Exception:
+                pass
+            if self.worker:
+                self.worker.seek(frame)
+                self.step_signal.emit(0)
         except Exception:
             pass
 
