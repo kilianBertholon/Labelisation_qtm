@@ -45,6 +45,8 @@ from PySide6.QtWidgets import QTabWidget
 from PySide6.QtWidgets import QProgressBar
 from PySide6.QtCore import Qt, QThread, Signal, Slot, QEvent
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush
+from PySide6.QtWidgets import QSizePolicy
+import math
 from PySide6.QtWidgets import QDialog, QListWidget, QTextEdit, QVBoxLayout, QListWidgetItem
 from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
 try:
@@ -904,6 +906,78 @@ class MainWindow(QWidget):
         # signal to request a step from worker thread
         self.init_ui()
 
+    def create_video_tiles(self, n: int, cols: int = 3):
+        """Create `n` video QLabel tiles laid out in `cols` columns.
+        This will clear any existing tiles and recreate them (used when loading
+        a different number of videos).
+        """
+        try:
+            # clear existing widgets from grid
+            try:
+                for i in reversed(range(self.video_grid.count())):
+                    item = self.video_grid.takeAt(i)
+                    w = item.widget() if item is not None else None
+                    if w:
+                        try:
+                            w.setParent(None)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            self.video_labels = []
+            # create new labels
+            for i in range(n):
+                lbl = QLabel(f"Cam {i+1}\n(aucune vidéo)")
+                # let labels expand to share the fixed video area
+                lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                lbl.setAlignment(Qt.AlignCenter)
+                lbl.setStyleSheet("background: #000; color: #fff; border: 1px solid #444;")
+                row = i // cols
+                col = i % cols
+                self.video_grid.addWidget(lbl, row, col)
+                self.video_labels.append(lbl)
+                try:
+                    lbl.installEventFilter(self)
+                except Exception:
+                    pass
+            # ensure equal stretch per column and row so tiles have same size
+            try:
+                rows = int(math.ceil(n / float(cols))) if cols > 0 else 1
+                for c in range(cols):
+                    try:
+                        self.video_grid.setColumnStretch(c, 1)
+                    except Exception:
+                        pass
+                for r in range(rows):
+                    try:
+                        self.video_grid.setRowStretch(r, 1)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            # if we only have a single tile and a video_area exists, try to make
+            # it take most of the screen height so the single video fills the view
+            try:
+                if n == 1 and hasattr(self, 'video_area') and self.video_area is not None:
+                    try:
+                        screen = QApplication.primaryScreen()
+                        sh = screen.size().height() if screen else 800
+                        # allocate ~85% of screen height to the video area
+                        self.video_area.setMinimumHeight(int(sh * 0.85))
+                    except Exception:
+                        pass
+                else:
+                    # reset to sensible minimum
+                    if hasattr(self, 'video_area') and self.video_area is not None:
+                        try:
+                            self.video_area.setMinimumSize(480, 360)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+
     def init_ui(self):
         main = QVBoxLayout()
 
@@ -993,20 +1067,28 @@ class MainWindow(QWidget):
 
         # Right: video grid (create once and keep as attributes to avoid double-parenting)
         self.video_grid = QGridLayout()
-        for i in range(6):
-            lbl = QLabel(f"Cam {i+1}\n(aucune vidéo)")
-            lbl.setFixedSize(480, 360)
-            lbl.setAlignment(Qt.AlignCenter)
-            lbl.setStyleSheet("background: #000; color: #fff; border: 1px solid #444;")
-            self.video_grid.addWidget(lbl, i // 3, i % 3)
-            self.video_labels.append(lbl)
-            try:
-                lbl.installEventFilter(self)
-            except Exception:
-                pass
+        # default to 6 tiles on startup
+        self.create_video_tiles(6, cols=3)
         self.right_widget = QWidget()
         right_layout = QVBoxLayout()
-        right_layout.addLayout(self.video_grid)
+        # create a fixed-size video area container so the overall video space
+        # doesn't change when number of tiles changes
+        try:
+            # make the video area expand with the window while keeping a sensible minimum
+            self.video_area = QWidget()
+            try:
+                self.video_area.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+                self.video_area.setMinimumSize(480, 360)
+            except Exception:
+                pass
+            area_layout = QVBoxLayout()
+            area_layout.setContentsMargins(0, 0, 0, 0)
+            area_layout.addLayout(self.video_grid)
+            self.video_area.setLayout(area_layout)
+            right_layout.addWidget(self.video_area)
+        except Exception:
+            # fallback: add grid directly
+            right_layout.addLayout(self.video_grid)
         # timeline widget showing annotation markers under the video grid
         try:
             self.timeline = TimelineWidget()
@@ -1034,7 +1116,7 @@ class MainWindow(QWidget):
         self.btn_toggle_side.clicked.connect(self.toggle_left_panel)
         ctrls.addWidget(self.btn_toggle_side)
 
-        btn_load = QPushButton('Charger 6 vidéos')
+        btn_load = QPushButton('Charger vidéos')
         btn_load.clicked.connect(self.load_videos)
         self.btn_prev = QPushButton('◀')
         self.btn_prev.setEnabled(False)
@@ -1108,19 +1190,91 @@ class MainWindow(QWidget):
 
     @Slot()
     def load_videos(self):
-        files, _ = QFileDialog.getOpenFileNames(self, 'Sélectionner vidéos (1..6)', str(Path.cwd()), 'Videos (*.avi *.mp4 *.mov)')
+        files, _ = QFileDialog.getOpenFileNames(self, 'Sélectionner vidéos', str(Path.cwd()), 'Videos (*.avi *.mp4 *.mov)')
         if not files:
             return
-        self.paths = files[:6]
-        for i in range(6):
-            if i < len(self.paths):
-                self.video_labels[i].setText(Path(self.paths[i]).name)
-            else:
-                self.video_labels[i].setText(f'Cam {i+1}\n(aucune vidéo)')
+        # if we have existing annotations, confirm because we will delete them
+        try:
+            if getattr(self, 'annotations', None) and len(self.annotations) > 0:
+                res = QMessageBox.question(self, 'Recharger vidéos', 'Des annotations existent et seront supprimées si vous rechargez de nouvelles vidéos. Continuer ?', QMessageBox.Yes | QMessageBox.No)
+                if res != QMessageBox.Yes:
+                    return
+        except Exception:
+            pass
+        # Clean up any existing worker, caches, popups and annotations
+        try:
+            if self.worker:
+                try:
+                    self.worker.stop()
+                except Exception:
+                    pass
+                try:
+                    self.worker.wait(200)
+                except Exception:
+                    pass
+                try:
+                    # remove any transcoded temporary files created by previous worker
+                    self.worker.cleanup_transcoded()
+                except Exception:
+                    pass
+                try:
+                    self.worker.close_all()
+                except Exception:
+                    pass
+                self.worker = None
+        except Exception:
+            pass
+        # close any open popups
+        try:
+            for p in list((self.popups or {}).values()):
+                try:
+                    p.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        self.popups = {}
+        # clear annotations and UI list (they refer to previous videos)
+        try:
+            self.annotations = []
+            self.ann_list.clear()
+        except Exception:
+            pass
 
-        if self.worker:
-            self.worker.stop()
-            self.worker.wait(200)
+        # keep all selected paths; but only tile the first up to 6 cameras
+        self.paths = files
+
+        # determine how many tiles we'll place in the grid (max 6)
+        try:
+            grid_n = min(len(self.paths), 6)
+            # deterministic layout mapping requested by user:
+            # 1 -> 1x1 (cols=1)
+            # 2 -> 2x1 (cols=2)
+            # 3 -> 2x2 (cols=2)
+            # 4 -> 2x2 (cols=2)
+            # 5 -> 3x2 (cols=3)
+            # 6 -> 3x2 (cols=3)
+            if grid_n <= 1:
+                cols = 1
+            elif grid_n == 2:
+                cols = 2
+            elif grid_n in (3, 4):
+                cols = 2
+            else:
+                cols = 3
+            self.create_video_tiles(max(1, grid_n), cols=cols)
+        except Exception:
+            pass
+
+        # set labels text for current tiles (only for tiled cams)
+        try:
+            for i, lbl in enumerate(self.video_labels):
+                if i < len(self.paths):
+                    lbl.setText(Path(self.paths[i]).name)
+                else:
+                    lbl.setText(f'Cam {i+1}\n(aucune vidéo)')
+        except Exception:
+            pass
         # GPU checkbox removed from UI; enable hwaccel by default if available
         use_hw = True
         print(f"GPU requested by default: {use_hw}")
@@ -1152,6 +1306,18 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
+        # if there are more than 6 videos, open the extras in popups so they remain synced
+        try:
+            grid_n = min(len(self.paths), 6)
+            for idx in range(grid_n, len(self.paths)):
+                try:
+                    # open popup for this camera index (worker uses same indexing)
+                    self.open_popup_for_camera(idx)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
     @Slot()
     def step_prev(self):
         if self.worker:
@@ -1174,11 +1340,27 @@ class MainWindow(QWidget):
 
     @Slot(list, int)
     def on_frames(self, qimages, frame_idx):
-        for i, img in enumerate(qimages):
-            if img is None:
-                continue
-            pix = QPixmap.fromImage(img).scaled(self.video_labels[i].size(), Qt.KeepAspectRatio)
-            self.video_labels[i].setPixmap(pix)
+        # Only update the tiled video labels (they may be fewer than the
+        # number of opened paths). Avoid indexing past available widgets.
+        try:
+            lbl_count = len(self.video_labels)
+            img_count = len(qimages)
+            upto = min(lbl_count, img_count)
+            for i in range(upto):
+                img = qimages[i]
+                if img is None:
+                    try:
+                        self.video_labels[i].clear()
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    pix = QPixmap.fromImage(img).scaled(self.video_labels[i].size(), Qt.KeepAspectRatio)
+                    self.video_labels[i].setPixmap(pix)
+                except Exception:
+                    pass
+        except Exception:
+            pass
         try:
             self.slider.blockSignals(True)
             self.slider.setValue(frame_idx)
