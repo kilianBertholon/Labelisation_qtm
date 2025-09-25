@@ -43,9 +43,9 @@ from PySide6.QtWidgets import (
 from PySide6.QtWidgets import QToolTip
 from PySide6.QtWidgets import QTabWidget
 from PySide6.QtWidgets import QProgressBar
-from PySide6.QtCore import Qt, QThread, Signal, Slot, QEvent
+from PySide6.QtCore import Qt, QThread, Signal, Slot, QEvent, QTimer
 from PySide6.QtGui import QImage, QPixmap, QPainter, QColor, QPen, QBrush
-from PySide6.QtWidgets import QSizePolicy
+from PySide6.QtWidgets import QSizePolicy, QStyle
 import math
 from PySide6.QtWidgets import QDialog, QListWidget, QTextEdit, QVBoxLayout, QListWidgetItem
 from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
@@ -91,6 +91,44 @@ class Annotation:
     frame_idx: int
     time_sec: float
     label: str
+
+
+class ClickableLabel(QLabel):
+    """QLabel that emits signals on double-click and right-click.
+    Using a dedicated widget avoids relying on eventFilter and is
+    more reliable across platforms.
+    """
+    double_clicked = Signal()
+    right_clicked = Signal()
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def mouseDoubleClickEvent(self, event):
+        try:
+            self.double_clicked.emit()
+        except Exception:
+            pass
+        try:
+            return super().mouseDoubleClickEvent(event)
+        except Exception:
+            return None
+
+    def mousePressEvent(self, event):
+        try:
+            if event.button() == Qt.RightButton:
+                try:
+                    self.right_clicked.emit()
+                except Exception:
+                    pass
+                # swallow right-click so context menus don't appear
+                return
+        except Exception:
+            pass
+        try:
+            return super().mousePressEvent(event)
+        except Exception:
+            return None
 
 
 class TimelineWidget(QWidget):
@@ -439,6 +477,12 @@ class VideoWorker(QThread):
         self.last_pos = [-1] * len(paths)
         self.prefetch_thread = None
         self.prefetch_stop = threading.Event()
+        self.lock = threading.Lock()
+        # optional global limit to avoid runaway memory when many cams
+        try:
+            self.max_total_cached_frames = max(500, self.cache_size * len(self.paths))
+        except Exception:
+            self.max_total_cached_frames = max(500, self.cache_size)
 
     def open_all(self):
         for i, p in enumerate(self.paths):
@@ -508,10 +552,14 @@ class VideoWorker(QThread):
                 self.prefetch_thread.join(timeout=1.0)
         except Exception:
             pass
-        for cap in self.caps:
-            if cap:
-                cap.release()
-        self.caps = []
+        with self.lock:
+            for cap in list(self.caps or []):
+                try:
+                    if cap:
+                        cap.release()
+                except Exception:
+                    pass
+            self.caps = []
         # attempt to remove any transcoded temporary files we created
         try:
             for p in list(self.transcoded_paths or []):
@@ -545,6 +593,31 @@ class VideoWorker(QThread):
             self.transcoded_paths = [None] * len(self.paths)
         except Exception:
             self.transcoded_paths = []
+
+    def stop(self):
+        """Robust stop: signal run loop to exit, stop playback, join prefetch and cleanup."""
+        try:
+            self.running = False
+        except Exception:
+            pass
+        try:
+            self.playing = False
+        except Exception:
+            pass
+        try:
+            self.prefetch_stop.set()
+            if self.prefetch_thread and self.prefetch_thread.is_alive():
+                try:
+                    self.prefetch_thread.join(timeout=1.0)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            # ensure caps and temp files are released/removed
+            self.close_all()
+        except Exception:
+            pass
 
     def run(self):
         if cv2 is None:
@@ -905,6 +978,7 @@ class MainWindow(QWidget):
         self.annotations = []
         # signal to request a step from worker thread
         self.init_ui()
+    # (no wheel coalescing by default — use immediate wheel stepping)
 
     def create_video_tiles(self, n: int, cols: int = 3):
         """Create `n` video QLabel tiles laid out in `cols` columns.
@@ -931,7 +1005,7 @@ class MainWindow(QWidget):
             max_cols = 3
             used_cols = min(max(1, cols), max_cols)
             for i in range(n):
-                lbl = QLabel(f"Cam {i+1}\n(aucune vidéo)")
+                lbl = ClickableLabel(f"Cam {i+1}\n(aucune vidéo)")
                 # let labels expand to share the fixed video area
                 lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
                 lbl.setAlignment(Qt.AlignCenter)
@@ -941,9 +1015,16 @@ class MainWindow(QWidget):
                 self.video_grid.addWidget(lbl, row, col)
                 self.video_labels.append(lbl)
                 try:
-                    lbl.installEventFilter(self)
+                    # primary: use direct signals from ClickableLabel
+                    idx = i
+                    lbl.double_clicked.connect(lambda _idx=idx: self.open_popup_for_camera(_idx))
+                    lbl.right_clicked.connect(lambda _idx=idx: self.open_popup_for_camera(_idx))
                 except Exception:
-                    pass
+                    try:
+                        # fallback: keep eventFilter for older QLabel behavior
+                        lbl.installEventFilter(self)
+                    except Exception:
+                        pass
             # ensure equal stretch per column and row so tiles have same size
             try:
                 rows = int(math.ceil(n / float(cols))) if cols > 0 else 1
@@ -1136,16 +1217,38 @@ class MainWindow(QWidget):
         self.btn_toggle_side.clicked.connect(self.toggle_left_panel)
         ctrls.addWidget(self.btn_toggle_side)
 
-        btn_load = QPushButton('Charger vidéos')
+        # Load button with icon
+        btn_load = QPushButton()
+        try:
+            btn_load.setIcon(self.style().standardIcon(QStyle.SP_DialogOpenButton))
+        except Exception:
+            btn_load.setText('Charger')
+        btn_load.setToolTip('Charger vidéos')
         btn_load.clicked.connect(self.load_videos)
-        self.btn_prev = QPushButton('◀')
+
+        # playback control buttons with icons
+        self.btn_prev = QPushButton()
         self.btn_prev.setEnabled(False)
+        try:
+            self.btn_prev.setIcon(self.style().standardIcon(QStyle.SP_MediaSeekBackward))
+        except Exception:
+            self.btn_prev.setText('◀')
         self.btn_prev.clicked.connect(self.step_prev)
-        self.btn_play = QPushButton('Play')
+
+        self.btn_play = QPushButton()
         self.btn_play.setEnabled(False)
+        try:
+            self.btn_play.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        except Exception:
+            self.btn_play.setText('Play')
         self.btn_play.clicked.connect(self.toggle_play)
-        self.btn_next = QPushButton('▶')
+
+        self.btn_next = QPushButton()
         self.btn_next.setEnabled(False)
+        try:
+            self.btn_next.setIcon(self.style().standardIcon(QStyle.SP_MediaSeekForward))
+        except Exception:
+            self.btn_next.setText('▶')
         self.btn_next.clicked.connect(self.step_next)
         self.slider = QSlider(Qt.Horizontal)
         self.slider.setEnabled(False)
@@ -1430,7 +1533,59 @@ class MainWindow(QWidget):
                 if obj in getattr(self, 'video_labels', []):
                     try:
                         cam_idx = self.video_labels.index(obj)
+                        # open popup (no fullscreen on double-click)
                         self.open_popup_for_camera(cam_idx)
+                        return True
+                    except Exception:
+                        pass
+            # open popup on right-click only (disable left-click popup)
+            if event.type() == QEvent.MouseButtonPress:
+                try:
+                    if obj in getattr(self, 'video_labels', []):
+                        try:
+                            # only respond to right clicks now
+                            btn = event.button() if hasattr(event, 'button') else None
+                            if btn == Qt.RightButton:
+                                cam_idx = self.video_labels.index(obj)
+                                self.open_popup_for_camera(cam_idx)
+                                return True
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            # handle mouse wheel for frame stepping when over a video label (immediate)
+            if event.type() == QEvent.Wheel:
+                if obj in getattr(self, 'video_labels', []):
+                    try:
+                        delta = 0
+                        try:
+                            delta = event.angleDelta().y()
+                        except Exception:
+                            try:
+                                delta = event.delta()
+                            except Exception:
+                                delta = 0
+                        if delta == 0:
+                            return False
+                        ticks = int(max(1, abs(delta) // 120))
+                        sign = 1 if delta > 0 else -1
+                        mods = QApplication.keyboardModifiers()
+                        if mods & Qt.ShiftModifier:
+                            ticks *= 10
+                        # pause playback for safe stepping
+                        try:
+                            if self.worker and getattr(self.worker, 'playing', False):
+                                self.worker.set_playing(False)
+                                try:
+                                    self.btn_play.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        try:
+                            self.step_signal.emit(sign * ticks)
+                        except Exception:
+                            pass
                         return True
                     except Exception:
                         pass
@@ -1439,15 +1594,9 @@ class MainWindow(QWidget):
         return super().eventFilter(obj, event)
 
     def open_popup_for_camera(self, cam_idx: int):
-        """Open (or focus) a VideoPopup for camera index cam_idx (0-based).
-
-        Usage:
-        - double-click a video tile in the UI
-        - or call `main_window.open_popup_for_camera(0)` to open camera 1 programmatically
-        """
+        """Open (or focus) a VideoPopup for camera index cam_idx (0-based)."""
         try:
             if cam_idx in (self.popups or {}) and self.popups.get(cam_idx):
-                # already open -> raise
                 try:
                     p = self.popups[cam_idx]
                     p.raise_()
@@ -1460,7 +1609,6 @@ class MainWindow(QWidget):
                 popup.setAttribute(Qt.WA_DeleteOnClose, True)
             except Exception:
                 pass
-            # remove reference when popup is destroyed
             try:
                 popup.destroyed.connect(lambda _=None, idx=cam_idx: self.popups.pop(idx, None))
             except Exception:
@@ -1477,20 +1625,51 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
+    def resizeEvent(self, event):
+        """Ensure displayed QPixmaps are rescaled to label size when the main window is resized.
+
+        This fixes the case where the window is made fullscreen but labels keep an old
+        pixmap size (e.g. when playback is paused)."""
+        try:
+            for lbl in getattr(self, 'video_labels', []) or []:
+                try:
+                    pm = lbl.pixmap()
+                    if pm is None:
+                        continue
+                    # scale the existing pixmap to the current label size
+                    scaled = pm.scaled(lbl.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                    lbl.setPixmap(scaled)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            return super().resizeEvent(event)
+        except Exception:
+            return None
+
+    # wheel coalescing removed; immediate wheel stepping restored
+
     @Slot()
     def toggle_play(self):
         if not self.worker:
             return
         if self.worker.playing:
             self.worker.set_playing(False)
-            self.btn_play.setText('Play')
+            try:
+                self.btn_play.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+            except Exception:
+                self.btn_play.setText('Play')
         else:
             if self.worker.frame_counts:
                 vals = [c for c in self.worker.frame_counts if c > 0]
                 if vals:
                     self.slider.setMaximum(min(vals))
             self.worker.set_playing(True)
-            self.btn_play.setText('Pause')
+            try:
+                self.btn_play.setIcon(self.style().standardIcon(QStyle.SP_MediaPause))
+            except Exception:
+                self.btn_play.setText('Pause')
 
     @Slot(int)
     def on_seek(self, v):
@@ -1828,11 +2007,39 @@ class MainWindow(QWidget):
                 sublab = ''
             rows.append({'frame': a.frame_idx, 'time_s': a.time_sec, 'label': lab, 'sublabel': sublab})
         df = pd.DataFrame(rows)
+        # include metadata
+        metadata = {
+            'export_date': time.strftime('%Y-%m-%dT%H:%M:%S'),
+            'video_files': [Path(p).name for p in getattr(self, 'paths', [])],
+            'n_annotations': len(rows),
+            'fps_used': None
+        }
         try:
-            df.to_excel(path, index=False)
+            if self.worker and getattr(self.worker, 'fps', None):
+                try:
+                    metadata['fps_used'] = float(min([f for f in self.worker.fps if f and f > 0]))
+                except Exception:
+                    metadata['fps_used'] = None
+        except Exception:
+            pass
+        # try Excel with metadata sheet, fallback to CSV with commented metadata header
+        try:
+            with pd.ExcelWriter(path) as writer:
+                df.to_excel(writer, sheet_name='ANNOTATIONS', index=False)
+                # write metadata as a small dataframe
+                md_items = [{'key': k, 'value': json.dumps(v, ensure_ascii=False) if not isinstance(v, (str, int, float, type(None))) else v} for k, v in metadata.items()]
+                md_df = pd.DataFrame(md_items)
+                md_df.to_excel(writer, sheet_name='METADATA', index=False)
         except Exception as e:
-            QMessageBox.critical(self, 'Erreur', f'Impossible d\'écrire le fichier: {e}')
-            return
+            # fallback to CSV: write metadata as commented lines
+            try:
+                with open(path, 'w', encoding='utf8') as f:
+                    for k, v in metadata.items():
+                        f.write(f"# {k}: {v}\n")
+                    df.to_csv(f, index=False)
+            except Exception as e2:
+                QMessageBox.critical(self, 'Erreur', f'Impossible d\'écrire le fichier: {e2}')
+                return
         QMessageBox.information(self, 'Exporté', f'Annotations exportées vers: {path}')
 
     def _find_label_hierarchy(self, label_text: str):
