@@ -925,15 +925,19 @@ class MainWindow(QWidget):
             except Exception:
                 pass
             self.video_labels = []
-            # create new labels
+            # create new labels. Use exactly `used_cols` columns (<= max_cols)
+            # so that when used_cols < max_cols each column can be stretched
+            # equally instead of using uneven colspans.
+            max_cols = 3
+            used_cols = min(max(1, cols), max_cols)
             for i in range(n):
                 lbl = QLabel(f"Cam {i+1}\n(aucune vidéo)")
                 # let labels expand to share the fixed video area
                 lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
                 lbl.setAlignment(Qt.AlignCenter)
                 lbl.setStyleSheet("background: #000; color: #fff; border: 1px solid #444;")
-                row = i // cols
-                col = i % cols
+                row = i // used_cols
+                col = i % used_cols
                 self.video_grid.addWidget(lbl, row, col)
                 self.video_labels.append(lbl)
                 try:
@@ -943,16 +947,32 @@ class MainWindow(QWidget):
             # ensure equal stretch per column and row so tiles have same size
             try:
                 rows = int(math.ceil(n / float(cols))) if cols > 0 else 1
-                for c in range(cols):
-                    try:
-                        self.video_grid.setColumnStretch(c, 1)
-                    except Exception:
-                        pass
-                for r in range(rows):
-                    try:
-                        self.video_grid.setRowStretch(r, 1)
-                    except Exception:
-                        pass
+                # ensure equal stretch for used columns (so columns have same width)
+                try:
+                    for c in range(used_cols):
+                        try:
+                            self.video_grid.setColumnStretch(c, 1)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # ensure any remaining logical columns (up to max_cols) do not steal space
+                try:
+                    for c in range(used_cols, max_cols):
+                        try:
+                            self.video_grid.setColumnStretch(c, 0)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    for r in range(rows):
+                        try:
+                            self.video_grid.setRowStretch(r, 1)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             except Exception:
                 pass
             # if we only have a single tile and a video_area exists, try to make
